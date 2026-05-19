@@ -17,19 +17,25 @@ from arduino.app_utils.logger import Logger
 
 logger = Logger("ALSASpeaker")
 
+_PIPEWIRE_DEVICE = "default"
+
 
 class ALSASpeaker(BaseSpeaker):
     """
-    ALSA (Advanced Linux Sound Architecture) speaker implementation.
+    ALSA speaker implementation with automatic USB / PipeWire routing.
 
-    This class handles local audio playback devices on Linux systems using ALSA.
+    Device selection priority:
+      1. Explicit ``device`` argument
+      2. ``AUDIO_DEVICE`` environment variable (set by host orchestrator)
+      3. Auto-detect: first available USB speaker (ALSA path)
+      4. Fallback: ALSA ``default`` device (PipeWire routing via PIPEWIRE_PROPS)
     """
 
     from .speaker import Speaker
 
     def __init__(
         self,
-        device: str | int = Speaker.USB_SPEAKER_1,
+        device: str | int = "",
         sample_rate: int = Speaker.RATE_16K,
         channels: int = Speaker.CHANNELS_MONO,
         format: FormatPlain | FormatPacked = np.int16,
@@ -41,70 +47,96 @@ class ALSASpeaker(BaseSpeaker):
         Initialize ALSA speaker.
 
         Args:
-            device (Union[str, int]): ALSA device identifier. Can be:
-                - int | str: device ordinal index (e.g., 0, 1, "0", "1", ...)
-                - str: device name (e.g., "plughw:CARD=MyCard,DEV=0", "hw:0,0", "CARD=MyCard,DEV=0")
+            device (Union[str, int]): Speaker device identifier. Can be:
+                - Empty string / omitted: auto-detect (USB first, then PipeWire default)
+                - int | str digit: ALSA card index (e.g., 0, 1)
+                - str: ALSA device name (e.g., "plughw:CARD=MyCard,DEV=0")
                 - str: device file path (e.g., "/dev/snd/by-id/usb-My-Device-00")
                 - str: Speaker.USB_SPEAKER_x macros
-                Default: Speaker.USB_SPEAKER_1 - First USB speaker available.
+                - str: Speaker.DEFAULT for explicit PipeWire routing
             sample_rate (int): Sample rate in Hz. Default: 16000.
             channels (int): Number of audio channels. Default: 1 (mono).
-            format (FormatPlain | FormatPacked): Audio format as one of:
-                - Type classes: np.int16, np.float32, np.uint8
-                - dtype objects: np.dtype('<i2'), np.dtype('>f4')
-                - Strings: 'int16', '<i2', '>f4', 'float32'
-                - Tuple of (format, is_packed): to specify if the format is packed (e.g. 24-bit audio)
-                Default: np.int16 - 16-bit signed platform-endian.
-            buffer_size (int): Size of the audio buffer that will be used as ALSA periodsize
-                parameter. Low values increase CPU usage but reduce latency. Default: 1024.
-            shared (bool): ALSA device sharing mode.
-                - False: Opens the device in exclusive mode to provide lowest latency
-                    but another application will fail when this instance is using the device.
-                - True: Opens the device in shared mode to allow other applications to use
-                    it at the same time but introduces higher latency. Will fail when another
-                    instance is already using the device in exclusive mode.
-                Default: True.
-            auto_reconnect (bool): Enable automatic reconnection on failure.
-                Default: True.
-
-            Note: When shared=True, buffer size is auto-negotiated due to
-                ALSA limitations to reach 125ms of latency.
+            format (FormatPlain | FormatPacked): Audio format. Default: np.int16.
+            buffer_size (int): ALSA periodsize. Default: 1024.
+            shared (bool): ALSA device sharing mode (USB path only). Default: True.
+            auto_reconnect (bool): Retry on failure. Default: True.
 
         Raises:
-            SpeakerConfigError: If the format is not supported.
+            SpeakerConfigError: If the device cannot be resolved or format is unsupported.
         """
         super().__init__(sample_rate, channels, format, buffer_size, auto_reconnect)
 
         try:
-            self.device_stable_ref = self._resolve_stable_ref(device)  # e.g., "plughw:CARD=MyMic,DEV=0"
-            self.name = self._resolve_name(self.device_stable_ref)  # Override parent name with a human-readable name
+            resolved_identifier = self._pick_device(device)
+            if self._is_alsa_resolvable(resolved_identifier):
+                self.device_stable_ref = self._resolve_stable_ref(resolved_identifier)
+            else:
+                self.device_stable_ref = str(resolved_identifier)  # raw device (PipeWire)
+            self.name = self._resolve_name(self.device_stable_ref)
         except Exception as e:
             raise SpeakerConfigError(f"Failed to look for speaker device '{device}': {e}")
+
         self.shared = shared
         self.logger = logger
 
         self._pcm: Optional[alsaaudio.PCM] = None
+        self._last_reconnection_attempt = 0.0
 
-        self._last_reconnection_attempt = 0.0  # Used for auto-reconnection when _read_audio is called
+    # ------------------------------------------------------------------
+    # Device selection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pick_device(device: str | int) -> str | int:
+        """
+        Resolve the effective device identifier applying the priority chain:
+        explicit arg → AUDIO_DEVICE env → USB auto-detect → PipeWire default.
+        """
+        if device != "" and device is not None:
+            return device
+
+        env_device = os.environ.get("AUDIO_DEVICE", "")
+        if env_device:
+            return env_device
+
+        usb_devices = ALSASpeaker.list_usb_devices()
+        if usb_devices:
+            return "usb:1"
+
+        return _PIPEWIRE_DEVICE
 
     @property
-    def alsa_format_idx(self) -> int:
-        """Get the ALSA format index corresponding to the current numpy dtype format."""
-        return getattr(alsaaudio, "PCM_FORMAT_" + self.alsa_format_name)
+    def is_pipewire(self) -> bool:
+        """True when the device is opened directly without ALSA card resolution (PipeWire path)."""
+        return not self._is_alsa_resolvable(self.device_stable_ref)
 
-    @property
-    def alsa_format_name(self) -> str:
-        """Get the ALSA format string corresponding to the current numpy dtype format."""
-        return _dtype_to_alsa_format_name(self.format, self.format_is_packed)
+    @staticmethod
+    def _is_alsa_resolvable(identifier: str | int) -> bool:
+        """Return True if the identifier should go through ALSA card resolution."""
+        if isinstance(identifier, int):
+            return True
+        if isinstance(identifier, str):
+            if identifier.isdigit():
+                return True
+            if identifier.startswith("usb:"):
+                return True
+            if identifier.startswith("/dev/snd/"):
+                return True
+            if re.match(r"^(plughw:|hw:)", identifier):
+                return True
+            if re.match(r"^(.+:)?CARD=", identifier):
+                return True
+            if re.match(r"^(.+:)?(\d+),(\d+)$", identifier):
+                return True
+        return False  # unknown format → raw PipeWire device
+
+    # ------------------------------------------------------------------
+    # Device enumeration (USB / ALSA path)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def list_devices() -> list:
-        """
-        Return a list of available ALSA speakers (plughw only).
-
-        Returns:
-            list: List of speakers in ALSA device name format.
-        """
+        """Return available ALSA plughw speakers."""
         devices = []
         try:
             for dev in alsaaudio.pcms(alsaaudio.PCM_PLAYBACK):
@@ -112,18 +144,11 @@ class ALSASpeaker(BaseSpeaker):
                     devices.append(dev.removeprefix("plughw:"))
         except Exception as e:
             logger.error(f"Error retrieving ALSA devices: {e}")
-            return []
-
         return devices
 
     @staticmethod
     def list_usb_devices() -> list:
-        """
-        Return a list of available USB ALSA speakers (plughw only).
-
-        Returns:
-            list: List of USB speakers in ALSA device name format.
-        """
+        """Return available USB ALSA speakers."""
         usb_devices = []
         try:
             cards = alsaaudio.cards()
@@ -133,37 +158,30 @@ class ALSASpeaker(BaseSpeaker):
                 device_path = Path(f"/sys/class/sound/card{card_index}/device")
                 if not device_path.exists():
                     continue
-
                 try:
                     real_path = device_path.resolve()
                     if "usb" in str(real_path).lower():
-                        # Find all hw and plughw devices for this card
                         for dev in alsaaudio.pcms(alsaaudio.PCM_PLAYBACK):
                             if dev.startswith("plughw:CARD=") and f"CARD={card_name}," in dev:
                                 usb_devices.append(dev.removeprefix("plughw:"))
-
                 except Exception as e:
                     logger.error(f"Error parsing card info for {card_name}: {e}")
-
         except Exception as e:
-            logger.error(f"Error listing USB microphones: {e}")
-
+            logger.error(f"Error listing USB speakers: {e}")
         return usb_devices
+
+    # ------------------------------------------------------------------
+    # Device resolution (USB / ALSA path)
+    # ------------------------------------------------------------------
 
     def _resolve_stable_ref(self, identifier: str | int) -> str:
         """
-        Resolve a speaker identifier to coordinates that are stable across
-        reconnections and that don't depend on current running system state.
-
-        Args:
-            identifier: Speaker identifier
-
-        Returns:
-            str: stable reference to the speaker in ALSA device name format
-
-        Raises:
-            RuntimeError: If speaker can't be resolved
+        Resolve a speaker identifier to a stable ALSA name (e.g. ``CARD=MyCard,DEV=0``).
+        Raises RuntimeError if the device cannot be found.
         """
+        if identifier == _PIPEWIRE_DEVICE:
+            return _PIPEWIRE_DEVICE
+
         all_devices = self.list_devices()
         if not all_devices:
             raise RuntimeError("No ALSA speakers found")
@@ -175,7 +193,6 @@ class ALSASpeaker(BaseSpeaker):
                 return identifier
 
             if identifier.startswith("usb:"):
-                # Resolve USB speaker by ordinal index
                 usb_index = int(identifier.removeprefix("usb:")) - 1
                 usb_devices = self.list_usb_devices()
                 if not usb_devices:
@@ -185,10 +202,9 @@ class ALSASpeaker(BaseSpeaker):
                 resolved_device = usb_devices[usb_index]
 
             elif identifier.startswith("/dev/snd/by-id"):
-                # Already a stable link, resolve audio device following the symlink
                 if not os.path.exists(identifier):
                     raise RuntimeError(f"{identifier} does not exist")
-                device_path = os.path.realpath(identifier)  # Resolves to /dev/snd/controlCX
+                device_path = os.path.realpath(identifier)
                 base_name = os.path.basename(device_path)
                 if base_name.startswith("controlC") and base_name[8:].isdigit():
                     card_idx = int(base_name[8:])
@@ -204,19 +220,16 @@ class ALSASpeaker(BaseSpeaker):
                         card_name = self._resolve_name(card_idx)
                         resolved_device = f"CARD={card_name},DEV={device_index}"
                     except Exception as e:
-                        raise RuntimeError(f"Failed to resolve card name for hw/plughw identifier {identifier}: {e}")
+                        raise RuntimeError(f"Failed to resolve card name for {identifier}: {e}")
 
                 card_name_format_match = re.match(r"^(.+:)?CARD=([^,]+),DEV=(\d+)$", identifier)
                 if card_name_format_match:
                     if card_name_format_match.group(1) is not None:
-                        # Remove prefix like "plughw:" or "hw:"
                         resolved_device = identifier.split(":", 1)[-1]
                     else:
-                        # Already in stable name format
                         resolved_device = identifier
 
         elif isinstance(identifier, int) or (isinstance(identifier, str) and identifier.isdigit()):
-            # Treat as /dev/controlC<card_idx>, resolve audio device by card number
             card_idx = int(identifier)
             card_name = self._resolve_name(card_idx)
             resolved_device = f"CARD={card_name},DEV=0"
@@ -229,23 +242,9 @@ class ALSASpeaker(BaseSpeaker):
         raise RuntimeError(f"Unsupported device identifier: {identifier}")
 
     def _resolve_runtime_ref(self, device_stable_ref: str) -> tuple[int, int]:
-        """
-        Resolve an ALSA device name to runtime prefix, card and device indexes
-        that depend on current running system state.
-
-        Args:
-            device_stable_ref: ALSA device name
-
-        Returns:
-            tuple: (card_index, device_index)
-                - card_index (int): ALSA card index
-                - device_index (int): ALSA device index
-
-        Raises:
-            RuntimeError: If speaker can't be resolved
-        """
+        """Resolve stable ALSA name to (card_index, device_index)."""
         card_indexes = alsaaudio.card_indexes()
-        if len(card_indexes) == 0:
+        if not card_indexes:
             raise RuntimeError("No ALSA sound cards found")
 
         match = re.match(r"^(.+:)?CARD=([^,]+),DEV=(\d+)$", device_stable_ref)
@@ -256,60 +255,58 @@ class ALSASpeaker(BaseSpeaker):
                 for card_idx, curr_card_name in zip(card_indexes, alsaaudio.cards()):
                     if curr_card_name == card_name:
                         return card_idx, device_index
-
             except Exception as e:
-                raise RuntimeError(f"Failed to resolve speaker runtime ref from stable ref {device_stable_ref}: {e}")
+                raise RuntimeError(f"Failed to resolve runtime ref from {device_stable_ref}: {e}")
 
-        raise RuntimeError(f"Invalid device reference for name resolution: {device_stable_ref}")
+        raise RuntimeError(f"Invalid device reference: {device_stable_ref}")
 
     def _resolve_name(self, device_ref: str | int) -> str:
-        """
-        Resolve a human-readable name for the speaker whose stable path or index
-        is provided by looking at ALSA card names.
+        """Return a human-readable name for the speaker."""
+        if not self._is_alsa_resolvable(device_ref):
+            return str(device_ref)  # raw PipeWire device — use as-is
 
-        Args:
-            device_ref (str | int): ALSA device name (str) or card index (int)
-
-        Returns:
-            str: compact, human readable name
-
-        Raises:
-            RuntimeError: If device name can't be resolved
-        """
         if isinstance(device_ref, str):
             match = re.match(r"^(?:plughw:|hw:)([^,]+),\d+,\d+$", device_ref)
             if match:
                 return match.group(1)
-            # This is a card stable refs like "plughw:CARD=MyDevice,DEV=0" or "CARD=MyDevice,DEV=0"
             match = re.match(r"^(.+:)?CARD=([^,]+),DEV=(\d+)$", device_ref)
             if match:
                 try:
-                    card_name = match.group(2)
-                    return card_name
+                    return match.group(2)
                 except Exception as e:
-                    raise RuntimeError(f"Failed to resolve speaker name from stable ref {device_ref}: {e}")
+                    raise RuntimeError(f"Failed to resolve name from {device_ref}: {e}")
 
         elif isinstance(device_ref, int):
-            # This is a card index like 0, 1, ...
             cards = alsaaudio.cards()
             if device_ref < 0 or device_ref >= len(cards):
                 raise RuntimeError(f"Card index {device_ref} out of range. Available: 0-{len(cards) - 1}")
-            card_name = cards[device_ref]
-            return card_name
+            return cards[device_ref]
 
-        raise RuntimeError(f"Invalid device reference for name resolution: {device_ref} (type:{type(device_ref)})")
+        raise RuntimeError(f"Invalid device reference: {device_ref} (type:{type(device_ref)})")
+
+    # ------------------------------------------------------------------
+    # PCM open / close / write
+    # ------------------------------------------------------------------
+
+    @property
+    def alsa_format_idx(self) -> int:
+        return getattr(alsaaudio, "PCM_FORMAT_" + self.alsa_format_name)
+
+    @property
+    def alsa_format_name(self) -> str:
+        return _dtype_to_alsa_format_name(self.format, self.format_is_packed)
 
     def _open_speaker(self) -> None:
-        """Open the ALSA PCM device."""
         logger.debug(f"Opening PCM device: {self.device_stable_ref}")
 
         try:
-            raw_hw_match = re.match(r"^(plughw:|hw:)[^,]+,\d+,\d+$", self.device_stable_ref)
-
-            if self.shared:
+            if self.is_pipewire:
+                device = _PIPEWIRE_DEVICE
+            elif self.shared:
                 card_idx, device_idx = self._resolve_runtime_ref(self.device_stable_ref)
                 device = f"plug_card_{card_idx}_dev_{device_idx}_spk"
             else:
+                raw_hw_match = re.match(r"^(plughw:|hw:)[^,]+,\d+,\d+$", self.device_stable_ref)
                 if raw_hw_match:
                     device = self.device_stable_ref
                 else:
@@ -360,10 +357,9 @@ class ALSASpeaker(BaseSpeaker):
         except Exception as e:
             raise RuntimeError(f"Unexpected error opening speaker: {e}")
 
-        logger.debug(f"PCM opened with params: {device}, {self.sample_rate}Hz, {self.channels}ch, {self.format}, {self.buffer_size} frames/IO")
+        logger.debug(f"PCM opened: {device}, {self.sample_rate}Hz, {self.channels}ch, {self.format}, {self.buffer_size} frames/IO")
 
     def _close_speaker(self) -> None:
-        """Close the ALSA PCM device."""
         if self._pcm is not None:
             try:
                 self._pcm.close()
@@ -373,18 +369,11 @@ class ALSASpeaker(BaseSpeaker):
                 self._pcm = None
 
     def _write_audio(self, audio_chunk: np.ndarray):
-        """
-        Write a single audio chunk to the ALSA speaker.
-
-        Automatically attempts to reconnect if the device is disconnected until
-        the device is available again.
-        """
         try:
             if self._pcm is None:
                 if not self.auto_reconnect:
                     return None
 
-                # Prevent spamming connection attempts
                 current_time = time.monotonic()
                 elapsed = current_time - self._last_reconnection_attempt
                 if elapsed < self.auto_reconnect_delay:
@@ -396,57 +385,39 @@ class ALSASpeaker(BaseSpeaker):
 
             result = self._pcm.write(audio_chunk.tobytes())
             if result < 0:
-                # Oops, a click already occurred before writing, the best we can do is retry this write
                 logger.debug(f"PCM write returned error code: {'EPIPE' if result == -32 else result}")
                 self._pcm.write(audio_chunk.tobytes())
 
         except (alsaaudio.ALSAAudioError, SpeakerOpenError, SpeakerWriteError, Exception) as e:
             if self._is_device_disconnected():
                 self.logger.error(
-                    f"Failed to read from speaker {self.name}: {e}."
+                    f"Failed to write to speaker {self.name}: {e}."
                     f"{' Retrying...' if self.auto_reconnect else ' Auto-reconnect is disabled, please restart the app.'}"
                 )
                 self._close_speaker()
                 return
-
             self.logger.error(f"Unexpected error writing audio chunk: {e}")
 
     def _is_device_disconnected(self) -> bool:
-        """Check if the device is still in the USB devices list."""
+        if self.is_pipewire:
+            return False  # PipeWire default is always present
         try:
-            usb_devices = self.list_devices()
-            return self.device_stable_ref not in usb_devices
+            return self.device_stable_ref not in self.list_devices()
         except Exception as e:
             logger.debug(f"Error checking device status: {e}")
-            return True  # Assume disconnected if we can't check
+            return True
 
 
 def _dtype_to_alsa_format_name(dtype: np.dtype, is_packed: bool = False) -> str:
-    """
-    Map numpy dtype to ALSA PCM format string.
-
-    Args:
-        dtype: Numpy dtype
-        is_packed: Whether the format is packed (e.g., 24-bit audio)
-
-    Returns:
-        ALSA PCM_FORMAT_* constant name
-
-    Raises:
-        SpeakerConfigError: If dtype is unsupported
-    """
+    """Map numpy dtype to ALSA PCM format string."""
     kind = dtype.kind
     size = dtype.itemsize
     byteorder = dtype.byteorder
 
-    # Determine endianness: '<' = little, '>' = big, '=' = native, '|' = not applicable
     if byteorder == "=" or byteorder == "|":
-        # Native byte order or not applicable (single byte)
         import sys
-
         byteorder = "<" if sys.byteorder == "little" else ">"
 
-    # Signed integers
     if kind == "i":
         if size == 1:
             return "S8"
@@ -457,7 +428,6 @@ def _dtype_to_alsa_format_name(dtype: np.dtype, is_packed: bool = False) -> str:
                 return "S24_LE" if byteorder == "<" else "S24_BE"
             return "S32_LE" if byteorder == "<" else "S32_BE"
 
-    # Unsigned integers
     elif kind == "u":
         if size == 1:
             return "U8"
@@ -466,7 +436,6 @@ def _dtype_to_alsa_format_name(dtype: np.dtype, is_packed: bool = False) -> str:
         elif size == 4:
             return "U32_LE" if byteorder == "<" else "U32_BE"
 
-    # Floating point
     elif kind == "f":
         if size == 4:
             return "FLOAT_LE" if byteorder == "<" else "FLOAT_BE"
@@ -477,19 +446,7 @@ def _dtype_to_alsa_format_name(dtype: np.dtype, is_packed: bool = False) -> str:
 
 
 def _alsa_format_name_to_dtype(alsa_format: str) -> np.dtype:
-    """
-    Map ALSA PCM format string to numpy dtype.
-
-    Args:
-        alsa_format: ALSA format name (e.g., 'S16_LE')
-
-    Returns:
-        Numpy dtype object, or None if unsupported
-
-    Raises:
-        SpeakerOpenError: If conversion is unsupported
-    """
-    # Direct mapping from ALSA format to numpy dtype string
+    """Map ALSA PCM format string to numpy dtype."""
     format_map = {
         "S8": "int8",
         "U8": "uint8",
@@ -497,8 +454,8 @@ def _alsa_format_name_to_dtype(alsa_format: str) -> np.dtype:
         "S16_BE": ">i2",
         "U16_LE": "<u2",
         "U16_BE": ">u2",
-        "S24_LE": "<i4",  # 24-bit packed in 32-bit container
-        "S24_BE": ">i4",  # 24-bit packed in 32-bit container
+        "S24_LE": "<i4",
+        "S24_BE": ">i4",
         "S32_LE": "<i4",
         "S32_BE": ">i4",
         "U32_LE": "<u4",

@@ -314,19 +314,15 @@ def mock_alsa_usb_speakers():
     """
     Fixture that mocks ALSA USB device detection for USB speaker tests.
 
-    This fixture patches Path.exists and Path.resolve to simulate a USB audio device
-    being present on the system. Use this fixture in tests that need to work with
-    USB speakers.
+    Patches Path.exists and Path.resolve to simulate a USB audio device being present.
 
     Example:
         def test_usb_speaker(mock_alsa_usb_speakers):
             spkr = Speaker()
             spkr.start()
-            # ... test operations
     """
     from unittest.mock import patch
 
-    # Mock USB device path resolution
     usb_device_path = "/sys/devices/platform/soc@0/4ef8800.usb/4e00000.usb/xhci-hcd.2.auto/usb1/1-1/1-1.3/1-1.3:1.0/sound/card0/pcmC0D0p"
 
     with (

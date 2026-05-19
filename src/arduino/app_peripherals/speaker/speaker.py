@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: MPL-2.0
 
+import os
 import numpy as np
 
 from .base_speaker import BaseSpeaker, FormatPlain, FormatPacked
@@ -11,27 +12,19 @@ class Speaker:
     """
     Unified Speaker class that can be configured for different speaker types.
 
-    This class serves as both a factory and a wrapper, automatically creating
-    the appropriate speaker implementation based on the provided configuration.
-
-    Supports:
-        - ALSA Speakers (local speakers connected to the system via ALSA)
+    Device routing is managed by the host orchestrator via the AUDIO_DEVICE or
+    PIPEWIRE_PROPS environment variables. The default device ('default') routes
+    audio through PipeWire's ALSA compatibility layer.
 
     Note: constructor arguments (except those in signature) must be provided in
     keyword format to forward them correctly to the specific speaker implementations.
-    Refer to the documentation of each speaker type for available parameters.
-    """
-
-    """
-    Constants for speaker configuration.
-
-    Provides commonly used values for devices, sample rates, channels, and buffer sizes.
-    Select appropriate values based on application requirements and hardware capabilities.
     """
 
     # =============================================================================
     # Predefined devices
     # =============================================================================
+    DEFAULT = "default"
+    """Routes audio through PipeWire's ALSA compat layer. Sink selection via PIPEWIRE_PROPS."""
     USB_SPEAKER_1 = "usb:1"
     """Shorthand for the first USB speaker available."""
     USB_SPEAKER_2 = "usb:2"
@@ -96,7 +89,7 @@ class Speaker:
 
     def __new__(
         cls,
-        device: str | int = USB_SPEAKER_1,
+        device: str = "",
         sample_rate: int = RATE_16K,
         channels: int = CHANNELS_MONO,
         format: FormatPlain | FormatPacked = np.int16,
@@ -104,48 +97,34 @@ class Speaker:
         **kwargs,
     ) -> BaseSpeaker:
         """
-        Create a speaker instance based on the device type.
+        Create a speaker instance.
 
         Args:
             device (Union[str, int]): Speaker device identifier. Supports:
-                - int | str: ALSA device ordinal index (e.g., 0, 1, "0", "1", ...)
-                - str: ALSA device name (e.g., "plughw:CARD=MyCard,DEV=0", "hw:0,0", "CARD=MyCard,DEV=0")
-                - str: ALSA device file path (e.g., "/dev/snd/by-id/usb-My-Device-00")
+                - Empty string / omitted: auto-detect (AUDIO_DEVICE env → USB → PipeWire default)
+                - int | str digit: ALSA card index (e.g., 0, 1)
+                - str: ALSA device name (e.g., "plughw:CARD=MyCard,DEV=0")
+                - str: device file path (e.g., "/dev/snd/by-id/usb-My-Device-00")
                 - str: Speaker.USB_SPEAKER_x macros
+                - str: Speaker.DEFAULT for explicit PipeWire routing
             sample_rate (int): Sample rate in Hz. Default: 16000.
             channels (int): Number of audio channels. Default: 1.
-            format (FormatPlain | FormatPacked): Audio format as one of:
-                - Type classes: np.int16, np.float32, np.uint8
-                - dtype objects: np.dtype('<i2'), np.dtype('>f4')
-                - Strings: 'int16', '<i2', '>f4', 'float32'
-                - Tuple of (format, is_packed): to specify if the format is packed (e.g. 24-bit audio)
-                Default: np.int16 - 16-bit signed platform-endian.
+            format (FormatPlain | FormatPacked): Audio format. Default: np.int16.
             buffer_size (int): Size of the audio buffer. Default: 1024.
-            **kwargs: Speaker-specific configuration parameters grouped by type:
-
-                ALSA Speaker Parameters:
-                    shared (bool): Whether the speaker can be used by multiple applications
-                        simultaneously. Default: True.
-                    auto_reconnect (bool): Whether to automatically attempt to reconnect
-                        if the speaker connection is lost. Default: True.
+            **kwargs: Passed to ALSASpeaker (e.g. shared, auto_reconnect).
 
         Returns:
             BaseSpeaker: Appropriate speaker implementation instance
 
         Raises:
-            SpeakerConfigError: If device type is not supported or parameters are invalid
+            SpeakerConfigError: If parameters are invalid
 
         Examples:
-            ALSA Speaker:
-
             ```python
-            speaker = Speaker(sample_rate=16000, channels=1)  # First USB speaker
-            speaker = Speaker(USB_SPEAKER_1, sample_rate=16000, channels=1)  # Equivalent to above
-            speaker = Speaker(1)  # Second speaker
-            speaker = Speaker("CARD=USB,DEV=0", format="S16_LE")
-            speaker = Speaker("plughw:CARD=USB,DEV=0")
-            speaker = Speaker("hw:0,0", buffer_size=2048)
-            speaker = Speaker("/dev/snd/by-id/usb-My-Device-00")  # Using device file path
+            speaker = Speaker()                    # auto: USB if present, else PipeWire
+            speaker = Speaker(Speaker.USB_SPEAKER_1)  # force first USB speaker
+            speaker = Speaker(Speaker.DEFAULT)     # force PipeWire default routing
+            speaker = Speaker("CARD=USB,DEV=0")    # explicit ALSA card name
             ```
         """
         from .alsa_speaker import ALSASpeaker  # Imported here to avoid circular dependency
@@ -165,7 +144,7 @@ class Speaker:
         sample_rate: int,
         channels: int,
         format: FormatPlain | FormatPacked,
-        device: str | int = USB_SPEAKER_1,
+        device: str = "",
     ):
         """
         Play raw PCM audio data.
@@ -174,17 +153,8 @@ class Speaker:
             pcm_audio (np.ndarray): Raw PCM audio data in ALSA PCM format.
             sample_rate (int): Sample rate in Hz.
             channels (int): Number of audio channels.
-            format (FormatPlain | FormatPacked): Audio format as one of:
-                - Type classes: np.int16, np.float32, np.uint8
-                - dtype objects: np.dtype('<i2'), np.dtype('>f4')
-                - Strings: 'int16', '<i2', '>f4', 'float32'
-                - Tuple of (format, is_packed): to specify if the format is packed (e.g. 24-bit audio)
-            device (Union[str, int], optional): Speaker device identifier. Supports:
-                - int | str: ALSA device ordinal index (e.g., 0, 1, "0", "1", ...)
-                - str: ALSA device name (e.g., "plughw:CARD=MyCard,DEV=0", "hw:0,0", "CARD=MyCard,DEV=0")
-                - str: ALSA device file path (e.g., "/dev/snd/by-id/usb-My-Device-00")
-                - str: Speaker.USB_SPEAKER_x macros
-                Default: Speaker.USB_SPEAKER_1 - First USB speaker available.
+            format (FormatPlain | FormatPacked): Audio format.
+            device (str): ALSA device name. Empty string uses AUDIO_DEVICE env or 'default'.
 
         Raises:
             SpeakerOpenError: If speaker can't be opened.
@@ -196,19 +166,14 @@ class Speaker:
             speaker.play_pcm(pcm_audio)
 
     @staticmethod
-    def play_wav(wav_audio: np.ndarray, device: str | int = USB_SPEAKER_1):
+    def play_wav(wav_audio: np.ndarray, device: str = ""):
         """
         Play audio from WAV format data.
         Note: Only uncompressed PCM WAV files are supported.
 
         Args:
             wav_audio (np.ndarray): WAV format audio data (including header).
-            device (Union[str, int], optional): Speaker device identifier. Supports:
-                - int | str: ALSA device ordinal index (e.g., 0, 1, "0", "1", ...)
-                - str: ALSA device name (e.g., "plughw:CARD=MyCard,DEV=0", "hw:0,0", "CARD=MyCard,DEV=0")
-                - str: ALSA device file path (e.g., "/dev/snd/by-id/usb-My-Device-00")
-                - str: Speaker.USB_SPEAKER_x macros
-                Default: Speaker.USB_SPEAKER_1 - First USB speaker available.
+            device (str): ALSA device name. Empty string uses AUDIO_DEVICE env or 'default'.
 
         Raises:
             SpeakerOpenError: If speaker can't be opened.

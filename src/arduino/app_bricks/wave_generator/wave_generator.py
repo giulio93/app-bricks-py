@@ -64,12 +64,11 @@ class WaveGenerator:
         if speaker is None:
             # Create internal Speaker instance optimized for real-time synthesis
             self._speaker = ALSASpeaker(
-                device=Speaker.USB_SPEAKER_1,
+                device=Speaker.DEFAULT,
                 sample_rate=Speaker.RATE_48K,
                 channels=Speaker.CHANNELS_MONO,
                 format=np.float32,
                 buffer_size=Speaker.BUFFER_SIZE_REALTIME,
-                shared=False,
             )
         else:
             if speaker.format != np.float32:

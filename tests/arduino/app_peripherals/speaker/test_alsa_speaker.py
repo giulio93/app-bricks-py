@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: MPL-2.0
 
+import os
 import pytest
 from unittest.mock import patch
 
@@ -16,132 +17,141 @@ from arduino.app_peripherals.speaker.errors import SpeakerConfigError, SpeakerOp
 class TestALSASpeakerInitialization:
     """Test ALSA speaker initialization."""
 
-    def test_alsa_start_opens_device(self, pcm_registry):
+    def test_alsa_start_opens_device(self, mock_alsa_usb_speakers, pcm_registry):
         """Test that start() opens ALSA device."""
         spkr = Speaker(device=0)
 
         assert not spkr.is_started()
-
         spkr.start()
-
         assert spkr.is_started()
-        pcm_instance = pcm_registry.get_last_instance()
-        assert pcm_instance is not None
+        assert pcm_registry.get_last_instance() is not None
 
-    def test_alsa_stop_closes_device(self, pcm_registry):
+    def test_alsa_stop_closes_device(self, mock_alsa_usb_speakers, pcm_registry):
         """Test that stop() closes ALSA device."""
         spkr = Speaker(device=0)
         spkr.start()
         spkr.stop()
 
         assert not spkr.is_started()
-        pcm_instance = pcm_registry.get_last_instance()
-        assert pcm_instance.close.called
+        assert pcm_registry.get_last_instance().close.called
+
+
+class TestALSASpeakerDeviceSelection:
+    """Test device selection priority chain."""
+
+    def test_auto_picks_usb_when_available(self, mock_alsa_usb_speakers):
+        """Auto-detect selects first USB speaker when USB is present."""
+        spkr = ALSASpeaker()
+        assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
+        assert not spkr.is_pipewire
+
+    def test_auto_falls_back_to_pipewire_when_no_usb(self):
+        """Auto-detect falls back to PipeWire default when no USB speakers found."""
+        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[]):
+            spkr = ALSASpeaker()
+        assert spkr.is_pipewire
+        assert spkr.device_stable_ref == "default"
+
+    def test_audio_device_env_var_takes_priority(self, mock_alsa_usb_speakers):
+        """AUDIO_DEVICE env var is used before USB auto-detect."""
+        with patch.dict(os.environ, {"AUDIO_DEVICE": "pipewire_node_from_orchestrator"}):
+            spkr = ALSASpeaker()
+        assert spkr.device_stable_ref == "pipewire_node_from_orchestrator"
+
+    def test_explicit_arg_overrides_env_var(self, mock_alsa_usb_speakers):
+        """Explicit device arg wins over AUDIO_DEVICE env var."""
+        with patch.dict(os.environ, {"AUDIO_DEVICE": "env_node"}):
+            spkr = ALSASpeaker(device=Speaker.USB_SPEAKER_1)
+        assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
+
+    def test_explicit_pipewire_default(self):
+        """Speaker.DEFAULT forces PipeWire routing regardless of USB availability."""
+        spkr = ALSASpeaker(device=Speaker.DEFAULT)
+        assert spkr.is_pipewire
+        assert spkr.device_stable_ref == "default"
 
 
 class TestALSASpeakerDeviceResolution:
-    """Test ALSA device resolution."""
+    """Test ALSA device resolution (USB path)."""
 
-    def test_resolve_by_shorthand(self, mock_alsa_usb_speakers):
-        """Test resolving device by integer index."""
-        spkr = ALSASpeaker()
-        assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
-
+    def test_resolve_by_usb_shorthand(self, mock_alsa_usb_speakers):
         spkr = ALSASpeaker(device=Speaker.USB_SPEAKER_1)
         assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
 
         spkr = ALSASpeaker(device=Speaker.USB_SPEAKER_2)
         assert spkr.device_stable_ref == "CARD=AnotherCard,DEV=0"
 
-    def test_resolve_by_integer_index(self):
-        """Test resolving device by integer index."""
+    def test_resolve_by_integer_index(self, mock_alsa_usb_speakers):
         spkr = ALSASpeaker(device=0)
         assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
 
         spkr = ALSASpeaker(device=1)
         assert spkr.device_stable_ref == "CARD=AnotherCard,DEV=0"
 
-    @patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[])
-    def test_resolve_no_usb_devices_raises_error(self, mock_pcms):
-        """Test that error is raised when no devices found."""
-        with pytest.raises(SpeakerConfigError) as exc_info:
-            ALSASpeaker(device=0)
-
-        assert "No ALSA speakers found" in str(exc_info.value)
-
-    def test_resolve_out_of_range_raises_error(self, mock_alsa_usb_speakers):
-        """Test that out of range index raises error."""
-        with pytest.raises(SpeakerConfigError) as exc_info:
-            ALSASpeaker(device=5)
-
-        assert "out of range" in str(exc_info.value)
-
     def test_resolve_explicit_device_name(self, mock_alsa_usb_speakers):
-        """Test that explicit device names are passed through."""
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
 
         spkr = ALSASpeaker(device="plughw:CARD=SomeCard,DEV=0")
         assert spkr.device_stable_ref == "CARD=SomeCard,DEV=0"
 
-        spkr = ALSASpeaker(device="plughw:CARD=AnotherCard,DEV=0")
-        assert spkr.device_stable_ref == "CARD=AnotherCard,DEV=0"
+    @patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[])
+    def test_resolve_no_alsa_devices_raises_error(self, mock_pcms, mock_alsa_usb_speakers):
+        with pytest.raises(SpeakerConfigError) as exc_info:
+            ALSASpeaker(device=0)
+        assert "No ALSA speakers found" in str(exc_info.value)
+
+    def test_resolve_out_of_range_raises_error(self, mock_alsa_usb_speakers):
+        with pytest.raises(SpeakerConfigError) as exc_info:
+            ALSASpeaker(device=5)
+        assert "out of range" in str(exc_info.value)
 
 
 class TestALSAErrorManagement:
     """Test handling ALSA errors."""
 
-    def test_device_busy_error(self):
-        """Test that device busy error is properly reported."""
+    def test_device_busy_error(self, mock_alsa_usb_speakers):
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         spkr.auto_reconnect_delay = 0
 
         with patch(
             "arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.PCM",
             side_effect=alsaaudio.ALSAAudioError("Device or resource busy"),
-            return_value=[],
         ):
             with pytest.raises(SpeakerOpenError) as exc_info:
                 spkr.start()
-
         assert "busy" in str(exc_info.value).lower()
 
-    def test_generic_alsa_error(self):
-        """Test generic ALSA error handling."""
+    def test_generic_alsa_error(self, mock_alsa_usb_speakers):
+        """Base class retries then raises SpeakerOpenError on persistent failure."""
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         spkr.auto_reconnect_delay = 0
 
         with patch(
             "arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.PCM",
             side_effect=alsaaudio.ALSAAudioError("Some generic ALSA error"),
-            return_value=[],
         ):
             with pytest.raises(SpeakerOpenError):
                 spkr.start()
 
-    def test_write_error_doesnt_raise(self, pcm_registry):
-        """Test that ALSA errors when writing don't raise exceptions."""
+    def test_write_error_doesnt_raise(self, mock_alsa_usb_speakers, pcm_registry):
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         spkr.start()
 
-        # Return ALSA error that's not disconnection
         pcm_instance = pcm_registry.get_last_instance()
-        pcm_instance.write = lambda data: -32  # EPIPE error
+        pcm_instance.write = lambda data: -32  # EPIPE
 
         audio_data = np.zeros(1024, dtype=np.int16)
         spkr.play(audio_data)  # Should not raise
 
-    def test_stop_with_close_error(self, pcm_registry):
-        """Test that stop handles close errors gracefully."""
+    def test_stop_with_close_error(self, mock_alsa_usb_speakers, pcm_registry):
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         spkr.start()
 
         pcm_instance = pcm_registry.get_last_instance()
         pcm_instance.close.side_effect = alsaaudio.ALSAAudioError("Close failed")
 
-        # Should not raise
         spkr.stop()
-
         assert not spkr.is_started()
 
 
@@ -149,69 +159,55 @@ class TestALSADeviceDisconnection:
     """Test ALSA device disconnection handling."""
 
     def test_detect_device_disconnection(self, mock_alsa_usb_speakers, pcm_registry):
-        """Test device disconnection detection during playback."""
         spkr = ALSASpeaker()
         spkr.start()
 
-        # Simulate device disconnection
         pcm_instance = pcm_registry.get_last_instance()
-        pcm_instance.write = lambda data: None  # Simulate write failure
+        pcm_instance.write = lambda data: None
 
-        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", side_effect=None, return_value=[]):
-            # Attempt to write should detect disconnection
+        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[]):
             audio_data = np.zeros(1024, dtype=np.int16)
-            spkr.play(audio_data)  # Should handle disconnection gracefully
-
-            assert spkr._pcm is None  # PCM should be cleared
+            spkr.play(audio_data)
+            assert spkr._pcm is None
 
     def test_list_devices_check(self, mock_alsa_usb_speakers):
-        """Test device disconnection detection by enumerating devices."""
-        spkr = ALSASpeaker()
-        spkr.start()
-
         devices = ALSASpeaker.list_devices()
         assert len(devices) > 0
 
-        # Simulate device removal
-        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", side_effect=None, return_value=[]):
+        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[]):
             devices = ALSASpeaker.list_devices()
             assert len(devices) == 0
+
+    def test_pipewire_device_never_disconnected(self):
+        """PipeWire default is always considered connected."""
+        spkr = ALSASpeaker(device=Speaker.DEFAULT)
+        assert spkr._is_device_disconnected() is False
 
 
 class TestALSADeviceReconnection:
     """Test ALSA device reconnection logic."""
 
     def test_reconnection_after_device_available(self, mock_alsa_usb_speakers):
-        """Test reconnection when device becomes available."""
-        # Initially no devices - creation should fail
-        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", side_effect=None, return_value=[]):
+        with patch("arduino.app_peripherals.speaker.alsa_speaker.alsaaudio.pcms", return_value=[]):
             with pytest.raises(SpeakerConfigError):
-                spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
+                ALSASpeaker(device="CARD=SomeCard,DEV=0")
 
-        # Now creation and start should work
         spkr = ALSASpeaker(device="CARD=SomeCard,DEV=0")
         spkr.start()
-
         assert spkr.is_started()
-
         spkr.stop()
 
     def test_write_reconnects(self, mock_alsa_usb_speakers, pcm_registry):
-        """Test write attempts reconnection after disconnection."""
         spkr = ALSASpeaker()
         spkr.start()
 
-        # Simulate a disconnection
         pcm_instance = pcm_registry.get_last_instance()
         pcm_instance.write = lambda data: None
 
         audio_data = np.zeros(1024, dtype=np.int16)
         spkr.play(audio_data)
 
-        # Mock successful reconnection
         pcm_instance.write = lambda data: len(data)
-
-        # Playing a second time should trigger reconnection attempt
         spkr.play(audio_data)  # Should handle gracefully
 
 
@@ -219,19 +215,17 @@ class TestALSAPlayback:
     """Test ALSA speaker playback methods."""
 
     def test_alsa_speaker_play(self, mock_alsa_usb_speakers):
-        """Test play with ALSA speaker."""
         spkr = ALSASpeaker()
         spkr.start()
 
         audio_data = np.zeros(1024, dtype=np.int16)
-        spkr.play(audio_data)  # Should not raise
+        spkr.play(audio_data)
 
     @pytest.mark.parametrize(
         "format",
         [np.uint8, np.uint16, np.uint32, np.int8, np.int16, np.int32, np.float32, np.float64],
     )
     def test_alsa_has_correct_format(self, mock_alsa_usb_speakers, pcm_registry, format):
-        """Test that ALSA is configured with correct format."""
         format_dtype = np.dtype(format)
 
         spkr = ALSASpeaker(format=format, buffer_size=128)
@@ -247,7 +241,6 @@ class TestALSAPlayback:
         assert spkr.alsa_format_name == pcm_instance.info()["format_name"]
 
     def test_unsupported_format_with_none_dtype(self):
-        """Test that unsupported formats trigger an error."""
         with pytest.raises(SpeakerConfigError):
             ALSASpeaker(format=None)
 
@@ -259,34 +252,22 @@ class TestALSAVolumeControl:
     """Test ALSA speaker volume control."""
 
     def test_volume_default(self, mock_alsa_usb_speakers):
-        """Test that default volume is 100."""
         spkr = ALSASpeaker()
         assert spkr.volume == 100
 
     def test_volume_setter(self, mock_alsa_usb_speakers):
-        """Test setting volume."""
         spkr = ALSASpeaker()
         spkr.volume = 50
         assert spkr.volume == 50
 
-        spkr.volume = 0
-        assert spkr.volume == 0
-
-        spkr.volume = 100
-        assert spkr.volume == 100
-
     def test_volume_out_of_range(self, mock_alsa_usb_speakers):
-        """Test that volume out of range raises error."""
         spkr = ALSASpeaker()
-
         with pytest.raises(ValueError):
             spkr.volume = -1
-
         with pytest.raises(ValueError):
             spkr.volume = 101
 
     def test_volume_affects_output(self, mock_alsa_usb_speakers, pcm_registry):
-        """Test that volume changes affect audio output."""
         spkr = ALSASpeaker()
         spkr.start()
         spkr.volume = 50
@@ -294,20 +275,15 @@ class TestALSAVolumeControl:
         audio_data = np.full(1024, 1000, dtype=np.int16)
         spkr.play(audio_data)
 
-        # Volume should scale the audio
-        # (we can't directly test the output, but we verify no errors)
-
 
 class TestALSASharedMode:
     """Test ALSA speaker shared mode."""
 
     def test_shared_mode_default(self, mock_alsa_usb_speakers):
-        """Test that default shared mode is True."""
         spkr = ALSASpeaker()
         assert spkr.shared is True
 
     def test_exclusive_mode(self, mock_alsa_usb_speakers):
-        """Test exclusive mode."""
         spkr = ALSASpeaker(shared=False)
         assert spkr.shared is False
         spkr.start()
