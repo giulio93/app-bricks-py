@@ -7,19 +7,28 @@ package main
 // AI Hub handler — env vars used:
 //   models_repository   base directory for all models (default: /models)
 //   model_directory     expected subdirectory name after ZIP extraction
-//   model_type          passed to qai_hub_models fetch -r
-//   model_name          passed to qai_hub_models fetch
-//   quantization        passed to qai_hub_models fetch -p
-//   chipset             passed to qai_hub_models fetch -c
-//   version             optional; passed to qai_hub_models fetch -v
+//   model_name          model ID, e.g. melotts_en
+//   model_type          runtime, e.g. voice_ai, genie, qnn_dlc
+//   quantization        precision, e.g. mixed_with_float, w4a16, w8a16
+//   chipset             e.g. qualcomm-qcs8275  (hyphens are converted to underscores)
+//   version             release version, e.g. 0.51.0
+
+// Models are served from a public S3 bucket — no credentials required.
+// URL template (chipset-specific):
+//   https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/
+//   {model_name}/releases/v{version}/{model_name}-{model_type}-{quantization}-{chipset}.zip
+// Fallback (no chipset):
+//   .../v{version}/{model_name}-{model_type}-{quantization}.zip
 
 import (
 	"fmt"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+const aiHubS3Base = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models"
 
 func runAIHub(action string) {
 	switch action {
@@ -42,14 +51,49 @@ func aiHubModelsRepo() string {
 	return "/models"
 }
 
+// aiHubResolveURL constructs and verifies the S3 download URL.
+// It tries the chipset-specific asset first, then falls back to the generic one.
+func aiHubResolveURL(client *http.Client, modelName, modelType, quantization, chipset, version string) (string, error) {
+	return aiHubResolveURLBase(client, modelName, modelType, quantization, chipset, version, aiHubS3Base)
+}
+
+func aiHubResolveURLBase(client *http.Client, modelName, modelType, quantization, chipset, version, s3Base string) (string, error) {
+	chipsetUnderscored := strings.ReplaceAll(chipset, "-", "_")
+	base := fmt.Sprintf("%s/%s/releases/v%s", s3Base, modelName, version)
+
+	candidates := []string{
+		fmt.Sprintf("%s/%s-%s-%s-%s.zip", base, modelName, modelType, quantization, chipsetUnderscored),
+		fmt.Sprintf("%s/%s-%s-%s.zip", base, modelName, modelType, quantization),
+	}
+
+	for _, url := range candidates {
+		resp, err := client.Head(url)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return url, nil
+		}
+	}
+
+	return "", fmt.Errorf("no asset found for model=%q type=%q quantization=%q chipset=%q version=%q — check https://aihub.qualcomm.com/models",
+		modelName, modelType, quantization, chipset, version)
+}
+
 func aiHubDownload() {
 	modelsRepo := aiHubModelsRepo()
 	modelDir := os.Getenv("model_directory")
-	modelType := os.Getenv("model_type")
 	modelName := os.Getenv("model_name")
+	modelType := os.Getenv("model_type")
 	quantization := os.Getenv("quantization")
 	chipset := os.Getenv("chipset")
 	version := os.Getenv("version")
+
+	if modelName == "" || modelType == "" || quantization == "" || chipset == "" || version == "" {
+		emitError("Missing required env vars: model_name, model_type, quantization, chipset, version")
+		os.Exit(1)
+	}
 
 	destDir := filepath.Join(modelsRepo, modelDir)
 	if _, err := os.Stat(destDir); err == nil {
@@ -57,33 +101,16 @@ func aiHubDownload() {
 		return
 	}
 
-	// Ask qai_hub_models for the download URL only
-	args := []string{"fetch", modelName, "-r", modelType, "-p", quantization, "-c", chipset}
-	if version != "" {
-		args = append(args, "-v", version)
-	}
-	args = append(args, "--url-only")
-
-	cmd := exec.Command("qai_hub_models", args...)
-	out, err := cmd.Output()
+	client := newHTTPClient()
+	url, err := aiHubResolveURL(client, modelName, modelType, quantization, chipset, version)
 	if err != nil {
-		stderr := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			stderr = strings.TrimSpace(string(ee.Stderr))
-		}
-		emitError(fmt.Sprintf("Failed to fetch model URL: %s", stderr))
-		os.Exit(1)
-	}
-
-	url := strings.TrimSpace(string(out))
-	if url == "" || !strings.HasPrefix(url, "http") {
-		emitError(fmt.Sprintf("Invalid URL from qai_hub_models: %q", url))
+		emitError(err.Error())
 		os.Exit(1)
 	}
 
 	emitInfo(fmt.Sprintf("Downloading model from: %s", url))
 
-	if err := downloadAndExtract(newHTTPClient(), url, modelsRepo, nil); err != nil {
+	if err := downloadAndExtract(client, url, modelsRepo, nil); err != nil {
 		emitError(fmt.Sprintf("Failed to download model %s: %v", modelName, err))
 		os.Exit(1)
 	}
