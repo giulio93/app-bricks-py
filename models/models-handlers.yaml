@@ -1,0 +1,28 @@
+handlers:
+  - ai-hub-handler:
+      description: "Handler for models from AI Hub"
+      actions:
+        - download:
+            command: ["models-downloader", "ai-hub", "download"]
+        - delete:
+            command: ["models-downloader", "ai-hub", "remove"]
+        - check:
+            command: ["models-downloader", "ai-hub", "check"]
+  - ei-handler:
+      description: "Handler for models from Edge Impulse"
+      actions:
+        - download:
+            command: ["models-downloader", "ei", "download"]
+        - delete:
+            command: ["models-downloader", "ei", "remove"]
+        - check:
+            command: ["models-downloader", "ei", "check"]
+  - hf-handler:
+      description: "Handler for models from Hugging Face"
+      actions:
+        - download:
+            command: ["models-downloader", "hf", "download"]
+        - delete:
+            command: ["models-downloader", "hf", "remove"]
+        - check:
+            command: ["models-downloader", "hf", "check"]
