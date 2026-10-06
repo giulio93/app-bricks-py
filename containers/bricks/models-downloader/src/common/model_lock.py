@@ -78,8 +78,3 @@ def is_locked(models_dir: str, key: str) -> bool:
     finally:
         os.close(fd)
     return False
-
-
-def busy_event(label: str) -> dict:
-    """The error event a run reports when another run holds the lock of *label*."""
-    return {"event": "error", "code": BUSY_CODE, "description": f"Another operation is in progress on model: {label}"}
