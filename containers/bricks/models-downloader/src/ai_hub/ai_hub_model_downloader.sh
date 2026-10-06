@@ -9,11 +9,16 @@ cd /models
 
 model_path="/models/${model_directory}"
 
+# Held until the download exits: exec passes fd 9 on to python.
+source /app/common/model_lock.sh
+hold_model_lock "${model_directory}" "${model_directory}"
+
 # Decide whether a usable model is already present. A ".download" marker, or a
 # leftover directory holding no model content (only the marker and/or the
 # ".arduino_metadata.yaml" record, including the ".tmp" sibling of an interrupted
 # atomic write), means a previous run was interrupted (e.g. SIGKILL) and must be
-# wiped and retried rather than reported as "Model exists".
+# wiped and retried rather than reported as "Model exists". The lock is ours, so no
+# other run is writing it.
 if [ -f "${model_path}/.download" ] || { [ -d "${model_path}" ] && [ -z "$(find "${model_path}" -mindepth 1 ! -name '.download' ! -name '.arduino_metadata.yaml*' -print -quit 2>/dev/null)" ]; }; then
     echo "{\"event\": \"info\", \"description\": \"Removing incomplete previous download: ${model_directory}\"}"
     rm -rf "${model_path:?}"

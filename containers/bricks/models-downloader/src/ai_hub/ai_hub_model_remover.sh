@@ -6,6 +6,9 @@
 
 cd /models
 
+source /app/common/model_lock.sh
+hold_model_lock "${model_directory}" "${model_directory}"
+
 cmd=(rm -fr "$model_directory")
 
 "${cmd[@]}"

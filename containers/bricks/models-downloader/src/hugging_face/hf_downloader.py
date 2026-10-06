@@ -120,6 +120,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.download_marker import MARKER_NAME, read_marker, write_marker
 from common.gguf_naming import catalog_gguf_declarations, declaration_covers, gguf_model_name
+from common import model_lock
 from common.model_size import paths_size_mb, size_mb
 from common.model_metadata import (
     ORIGIN_BUILTIN,
@@ -278,8 +279,10 @@ def emit_json_info(
     print(json.dumps(data), flush=True)
 
 
-def emit_json_error(description: str, downloading: bool | None = None):
+def emit_json_error(description: str, downloading: bool | None = None, code: str | None = None):
     data: dict = {"event": "error", "description": description}
+    if code is not None:
+        data["code"] = code
     if downloading is not None:
         data["downloading"] = downloading
     print(json.dumps(data), flush=True)
@@ -1529,6 +1532,21 @@ def validate_hub_source_or_exit(source: dict, token: str | None = None) -> None:
 
 
 def main():
+    # A lock lasts as long as the process; released here too for a main() run in-process.
+    try:
+        _main()
+    finally:
+        model_lock.release_all()
+
+
+def hold_lock_or_exit(models_dir: str, repo_id: str) -> None:
+    """Hold the repository's lock, or report the run holding it and exit."""
+    if not model_lock.acquire(models_dir, repo_id):
+        emit_json_error(f"Another operation is in progress on model: {repo_id}", code=model_lock.BUSY_CODE)
+        raise SystemExit(1)
+
+
+def _main():
     parser = argparse.ArgumentParser(description="Download an Hugging Face model via HF download API")
     parser.add_argument(
         "--model-url",
@@ -1681,21 +1699,22 @@ def main():
             flush=True,
         )
     elif args.check:
-        # Files first, marker second: the marker is per repository, but a repository
+        # Files first, lock second: the lock is per repository, but a repository
         # directory holds several quantizations, so a download in progress there says
         # nothing about the one being asked for — which may well be installed already.
-        # A file the marker's own download left without a record is not installed either:
-        # it reads as the download still in progress, which the next download clears.
+        # A file the marker's own download left without a record is not installed either.
         if is_installed(output_dir, patterns) and not unfinished_files(output_dir, patterns):
             present = [str(p) for p in matching_files(output_dir, patterns) if p.suffix == ".gguf"]
             emit_json_info(f"Model exists: {allow_pattern}", downloading=False, size_mb=downloaded_size_mb(present))
-        elif (Path(output_dir) / MARKER_NAME).is_file():
-            # A ".download" marker means a download is in progress or was interrupted
+        elif model_lock.is_locked(args.output_dir, repo_id):
+            # The lock, not the ".download" marker, says a download is running: a marker
+            # with the lock free is what a killed run left, and the next download clears it.
             emit_json_info(f"Model downloading: {repo_id}", downloading=True)
         else:
             emit_json_error(f"Model does not exist: {allow_pattern}", downloading=False)
             raise SystemExit(1)
     elif args.delete:
+        hold_lock_or_exit(args.output_dir, repo_id)
         if args.verbose:
             emit_json_info(f"Deleting files matching '{allow_pattern}' in {output_dir}")
         delete_matched_files(output_dir, args.output_dir, allow_pattern, args.verbose)
@@ -1727,6 +1746,10 @@ def main():
         # Windows os.environ upper-cases its keys when copied, which would drop every
         # lowercase download variable; chaining delegates the lookup instead.
         metadata_env = ChainMap({"model_directory": model_directory}, os.environ)
+
+        # Held until the process exits: a second download into this repository stops here
+        # instead of discarding this run's files as the leftovers of a killed one.
+        hold_lock_or_exit(args.output_dir, repo_id)
 
         # Per-repo ".download" marker: present => prior run killed mid-download, discard
         # what it left and retry; absent but the requested files present => complete.

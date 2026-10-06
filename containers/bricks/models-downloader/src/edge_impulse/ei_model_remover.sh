@@ -8,6 +8,9 @@ cd /models
 
 model_folder="${model_name%.*}"
 
+source /app/common/model_lock.sh
+hold_model_lock "${model_folder}" "${model_name}"
+
 rm -fr "${model_folder}"
 if [ $? -ne 0 ]; then
     echo "{\"event\": \"error\", \"description\": \"Failed to remove model: ${model_name}\"}"

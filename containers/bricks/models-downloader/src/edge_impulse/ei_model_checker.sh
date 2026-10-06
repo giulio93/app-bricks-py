@@ -7,10 +7,14 @@
 model_folder="${model_name%.*}"
 model_path="/models/${model_folder}"
 
-if [ -f "${model_path}/.download" ]; then
+source /app/common/model_lock.sh
+
+# The lock, not the ".download" marker, says a download is running: a marker with the
+# lock free is what a killed run left, and the next download discards it.
+if model_lock_held "${model_folder}"; then
     echo "{\"event\": \"info\", \"description\": \"Model downloading: ${model_name}\", \"downloading\": true}"
     exit 0
-elif [ -f "${model_path}/${model_name}" ]; then
+elif [ ! -f "${model_path}/.download" ] && [ -f "${model_path}/${model_name}" ]; then
     python /app/common/model_size.py --description "Model exists: ${model_name}" --downloading false "${model_path}" \
         || echo "{\"event\": \"info\", \"description\": \"Model exists: ${model_name}\", \"downloading\": false, \"size_mb\": null}"
     exit 0

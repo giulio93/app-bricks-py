@@ -11,6 +11,7 @@ tested explicitly here. The rest covers the local filesystem bookkeeping: what c
 an installed model, and what the delete path leaves behind.
 """
 
+import fcntl
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from huggingface_hub.errors import (
     RevisionNotFoundError,
 )
 
+from common import model_lock
 from common.download_marker import MARKER_NAME, read_marker
 from common.model_metadata import METADATA_NAME, metadata_records, read_metadata
 from hugging_face import hf_downloader
@@ -1132,6 +1134,23 @@ def _run_main(monkeypatch, *argv):
 
 
 @pytest.fixture
+def hold_repo_lock():
+    """Hold a repository's lock as another run would, on a descriptor of its own."""
+    fds = []
+
+    def _hold(models_dir, repo_id):
+        path = model_lock.lock_path(str(models_dir), repo_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fds.append(fd)
+
+    yield _hold
+    for fd in fds:
+        os.close(fd)
+
+
+@pytest.fixture
 def stub_download(monkeypatch):
     """Stub the Hub out: record the patterns asked for, and create the files they name.
 
@@ -1310,20 +1329,25 @@ def test_interrupted_patterns_reads_what_the_marker_recorded(tmp_path):
     assert interrupted_patterns(tmp_path / "absent") == []
 
 
-def test_check_answers_for_the_requested_quantization_only(tmp_path, monkeypatch, capsys):
+def test_check_answers_for_the_requested_quantization_only(tmp_path, monkeypatch, capsys, hold_repo_lock):
     models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q4_0.gguf")
 
-    # Installed, even though the repository directory carries a marker for another file.
+    # Installed, even though another quantization of the repository is being downloaded.
     (repo / MARKER_NAME).write_text("{}")
+    hold_repo_lock(models_dir, "unsloth/Qwen3-0.6B-GGUF")
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q4_0", "--output-dir", str(models_dir))
     assert read_events(capsys)[-1] == {"event": "info", "description": "Model exists: *Q4_0*.gguf", "downloading": False, "size_mb": 0.0}
 
-    # The quantization the marker stands for is the one still on its way.
+    # The quantization that is not there yet is the one on its way.
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
     assert read_events(capsys)[-1]["downloading"] is True
 
-    # Without a marker, a quantization that is not there is simply missing.
-    (repo / MARKER_NAME).unlink()
+
+def test_check_calls_a_missing_quantization_missing_when_no_run_holds_the_lock(tmp_path, monkeypatch, capsys):
+    models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q4_0.gguf")
+
+    # A marker with the lock free is what a killed run left: nothing is on its way.
+    (repo / MARKER_NAME).write_text("{}")
     with pytest.raises(SystemExit):
         _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
     assert read_events(capsys)[-1] == {"event": "error", "description": "Model does not exist: *Q3_K_S*.gguf", "downloading": False}
@@ -1334,10 +1358,22 @@ def test_check_does_not_call_a_file_its_stopped_download_left_installed(tmp_path
 
     The file is complete, the marker names it, no record covers it: the listing ignores
     it and the API cannot delete it. --check used to answer "Model exists", which made
-    the host refuse every new download of it; it is a download still in progress.
+    the host refuse every new download of it. No run holds the lock, so it is the
+    leftover of a dead run: not installed, and the next download discards it.
     """
     models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q3_K_S.gguf")
     (repo / MARKER_NAME).write_text(json.dumps({"status": "downloading", "file_patterns": ["*Q3_K_S*.gguf"]}))
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
+
+    assert read_events(capsys)[-1] == {"event": "error", "description": "Model does not exist: *Q3_K_S*.gguf", "downloading": False}
+
+
+def test_check_reports_a_download_holding_the_lock(tmp_path, monkeypatch, capsys, hold_repo_lock):
+    models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q3_K_S.gguf")
+    (repo / MARKER_NAME).write_text(json.dumps({"status": "downloading", "file_patterns": ["*Q3_K_S*.gguf"]}))
+    hold_repo_lock(models_dir, "unsloth/Qwen3-0.6B-GGUF")
 
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
 
@@ -1346,6 +1382,49 @@ def test_check_does_not_call_a_file_its_stopped_download_left_installed(tmp_path
         "description": "Model downloading: unsloth/Qwen3-0.6B-GGUF",
         "downloading": True,
     }
+
+
+def test_download_refuses_a_repository_another_run_holds(tmp_path, monkeypatch, stub_download, capsys, hold_repo_lock):
+    """The second run used to read the first one's marker as a leftover and wipe its files."""
+    monkeypatch.setattr(model_lock, "WAIT_SECONDS", 0)
+    models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q3_K_S.gguf")
+    (repo / MARKER_NAME).write_text(json.dumps({"status": "downloading", "file_patterns": ["*Q3_K_S*.gguf"]}))
+    hold_repo_lock(models_dir, "unsloth/Qwen3-0.6B-GGUF")
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, "--model-url", "llamacpp:unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
+
+    assert read_events(capsys)[-1] == {
+        "event": "error",
+        "description": "Another operation is in progress on model: unsloth/Qwen3-0.6B-GGUF",
+        "code": "download_in_progress",
+    }
+    assert stub_download == []
+    # The other run's files and marker are left to it.
+    assert (repo / "Qwen3-0.6B-Q3_K_S.gguf").is_file()
+    assert (repo / MARKER_NAME).is_file()
+
+
+def test_delete_refuses_a_repository_another_run_holds(tmp_path, monkeypatch, capsys, hold_repo_lock):
+    monkeypatch.setattr(model_lock, "WAIT_SECONDS", 0)
+    models_dir, repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q4_0.gguf")
+    hold_repo_lock(models_dir, "unsloth/Qwen3-0.6B-GGUF")
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, "--delete", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q4_0", "--output-dir", str(models_dir))
+
+    assert read_events(capsys)[-1]["code"] == "download_in_progress"
+    assert (repo / "Qwen3-0.6B-Q4_0.gguf").is_file()
+
+
+def test_download_releases_the_lock_when_it_ends(tmp_path, monkeypatch, stub_download):
+    models_dir, _repo = _qwen_repo(tmp_path, "Qwen3-0.6B-Q4_0.gguf")
+
+    _run_main(monkeypatch, "--model-url", "llamacpp:unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
+
+    assert not model_lock.is_locked(str(models_dir), "unsloth/Qwen3-0.6B-GGUF")
+    # The lock file lives outside the model directory, which a cleanup removes whole.
+    assert Path(model_lock.lock_path(str(models_dir), "unsloth/Qwen3-0.6B-GGUF")).parent == models_dir / ".locks"
 
 
 def test_check_calls_a_recorded_file_installed_despite_its_marker(tmp_path, monkeypatch, capsys):
