@@ -18,10 +18,15 @@ Usage:
 """
 
 import argparse
+import copy
+import fcntl
 import fnmatch
 import json
 import os
 import sys
+from datetime import datetime, UTC
+
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.download_marker import read_marker
@@ -34,6 +39,7 @@ from common.model_metadata import (
     read_metadata,
     record_for_model_id,
 )
+from common.model_lock import MODELS_ROOT_DEFAULT, models_root
 from common.model_size import path_size_bytes, paths_size_bytes, size_mb
 from common.model_source import HANDLER_HUGGING_FACE, model_publisher, model_runtime
 from common.models_list import get_model_subdir, load_models_list, MODELS_LIST_PATH
@@ -410,7 +416,8 @@ def find_llamacpp_models(models_base_dir, declarations=()):
             # The mmproj file in the same directory is part of this model, and the two
             # are summed in bytes, like the downloader sizes the same files.
             model_files = [full_path] + ([os.path.join(root, mmproj_files[0])] if mmproj_files else [])
-            disk_size_mb = size_mb(paths_size_bytes(model_files))
+            disk_size_bytes = paths_size_bytes(model_files)
+            disk_size_mb = size_mb(disk_size_bytes)
             entry = {
                 "id": f"llamacpp:{model_name}",
                 "name": model_name,
@@ -429,6 +436,7 @@ def find_llamacpp_models(models_base_dir, declarations=()):
             }
             if not downloading and disk_size_mb is not None:
                 entry["disk_size_mb"] = disk_size_mb
+                entry["_disk_size_bytes"] = disk_size_bytes
             if mmproj_files:
                 entry["mmproj"] = os.path.join(root, mmproj_files[0])
             if record is not None:
@@ -484,6 +492,355 @@ def declared_model_id(declarations, rel_dir, filename, taken):
     return None
 
 
+# --------------------------------------------------------------------------- #
+# The models index: the listing, written at the root of the models tree
+# --------------------------------------------------------------------------- #
+#
+# The host reads ``<models root>/.models-index.yaml`` instead of running this listing
+# for every request: the listing container writes it at startup, and every download
+# and delete rewrites it before exiting. Its ``models`` list has the models-list.yaml
+# shape — one ``{<id>: {...}}`` map per model — so the host parses it with the same
+# code, and each model carries what only the filesystem can tell:
+#
+#   status      installed | not-installed | downloading
+#   size_bytes  measured on disk once installed, declared otherwise (absent if unknown)
+#   folder      the model's directory, relative to the models root (absent if none)
+#   origin      curated (declared by models-list.yaml) | user (downloaded ad hoc)
+#
+# A curated model keeps its whole models-list.yaml entry. A user model gets the entry
+# the host would build for it: its handler, the brick that can run it, and the
+# variables of its download record as the deployment of the listed board, which is
+# what a re-download or a delete is driven by.
+#
+# The file is replaced atomically, and the scan and the write run under an exclusive
+# lock on ``<models root>/.listing.lock``: two downloads finishing together would
+# otherwise race, and the one that scanned first could rename last.
+
+INDEX_NAME = ".models-index.yaml"
+LISTING_LOCK_NAME = ".listing.lock"
+
+STATUS_INSTALLED = "installed"
+STATUS_NOT_INSTALLED = "not-installed"
+STATUS_DOWNLOADING = "downloading"
+
+INDEX_ORIGIN_CURATED = "curated"
+INDEX_ORIGIN_USER = "user"
+
+LLM_BRICK = "arduino:llm"
+VLM_BRICK = "arduino:vlm"
+
+_MIB = 1024 * 1024
+
+_INDEX_HEADER = "# Written by the Arduino models-downloader listing; rewritten after every download and delete.\n# Do not edit.\n"
+
+
+def public_entry(entry):
+    """*entry* without the private ``_`` keys the listing keeps for itself."""
+    return {k: v for k, v in entry.items() if not k.startswith("_")}
+
+
+def index_status(entry):
+    """The index ``status`` of a listing entry."""
+    if entry.get("downloading"):
+        return STATUS_DOWNLOADING
+    return STATUS_INSTALLED if entry.get("installed") else STATUS_NOT_INSTALLED
+
+
+def index_size_bytes(entry):
+    """Bytes on disk once installed, else the declared (or expected) size, else None."""
+    if entry.get("installed") and entry.get("_disk_size_bytes") is not None:
+        return entry["_disk_size_bytes"]
+    for key in ("model_size_mb", "size_mb"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(round(value * _MIB))
+    return None
+
+
+def index_folder(entry, models_dir):
+    """The model's directory relative to *models_dir*, posix, or None."""
+    path = entry.get("path")
+    if not path:
+        return None
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    rel = os.path.relpath(folder, models_dir)
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def _index_metadata(declared, entry):
+    """The entry's models-list.yaml metadata, plus runtime, publisher and source URL."""
+    metadata = dict(declared or {})
+    for key, value in (("runtime", entry.get("runtime")), ("publisher", entry.get("model_publisher"))):
+        if value:
+            metadata[key] = value
+    model_url = ((entry.get("download_metadata") or {}).get("inputs") or {}).get("model_url")
+    if model_url and "source-model-url" not in metadata:
+        metadata["source-model-url"] = model_url
+    return metadata
+
+
+def _with_state(model, entry, models_dir, origin):
+    """*model* with the index fields of *entry* added."""
+    if entry.get("handler"):
+        model["handler"] = entry["handler"]
+    metadata = _index_metadata(model.get("metadata"), entry)
+    if metadata:
+        model["metadata"] = metadata
+    model["status"] = index_status(entry)
+    size_bytes = index_size_bytes(entry)
+    if size_bytes is not None:
+        model["size_bytes"] = size_bytes
+    folder = index_folder(entry, models_dir)
+    if folder is not None:
+        model["folder"] = folder
+    model["origin"] = origin
+    return model
+
+
+def user_index_model(entry, board):
+    """The index entry of an ad-hoc model, or None when its record cannot drive it.
+
+    The record's ``inputs`` are what a re-download or a delete is run with, so a model
+    without one (an install older than the record), or whose record names another
+    model (the record of a sibling quantization), is left out rather than listed with
+    variables that would point at the wrong files.
+    """
+    record = entry.get("download_metadata") or {}
+    handler = record.get("handler")
+    inputs = record.get("inputs")
+    if not handler or not isinstance(inputs, dict) or not inputs:
+        print(f"index: skipping {entry['id']}: no download record", file=sys.stderr)
+        return None
+    if record.get("model_id") != entry["id"]:
+        print(f"index: skipping {entry['id']}: its download record names {record.get('model_id')}", file=sys.stderr)
+        return None
+    return {
+        "name": entry.get("name", entry["id"]),
+        # A projection file is what makes a GGUF multimodal.
+        "bricks": [{"id": VLM_BRICK if entry.get("mmproj") else LLM_BRICK}],
+        "deployment": {
+            "handler": handler,
+            "platforms": [{board or "": {"variables": {k: str(v) for k, v in inputs.items()}}}],
+        },
+    }
+
+
+def index_models(results, models_list, models_dir, board):
+    """The index ``models`` list for the listing *results* of *models_list*."""
+    declared = {}
+    for item in models_list:
+        if isinstance(item, dict):
+            for model_id, model_data in item.items():
+                if isinstance(model_data, dict):
+                    declared.setdefault(model_id, model_data)
+    models = []
+    for entry in results:
+        if entry.get("model_origin") == ORIGIN_BUILTIN and entry["id"] in declared:
+            model = _with_state(copy.deepcopy(declared[entry["id"]]), entry, models_dir, INDEX_ORIGIN_CURATED)
+        else:
+            model = user_index_model(entry, board)
+            if model is None:
+                continue
+            model = _with_state(model, entry, models_dir, INDEX_ORIGIN_USER)
+        models.append({entry["id"]: model})
+    return models
+
+
+def write_index(root, models_dir, yaml_path=MODELS_LIST_PATH, supported_board=None):
+    """List *models_dir* and write the result to ``<root>/.models-index.yaml``.
+
+    Holds ``<root>/.listing.lock`` from the scan to the rename, waiting for another
+    listing to finish first. Returns ``(results, models_list)`` like build_listing.
+    """
+    board = supported_board or os.environ.get("BOARD_NAME", "")
+    lock_fd = os.open(os.path.join(root, LISTING_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        results, models_list = build_listing(models_dir, yaml_path, supported_board)
+        document = {
+            "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "board": board,
+            "models": index_models(results, models_list, models_dir, board),
+        }
+        path = os.path.join(root, INDEX_NAME)
+        tmp = f"{path}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(_INDEX_HEADER)
+                yaml.safe_dump(document, f, sort_keys=False, default_flow_style=False, allow_unicode=True, width=4096)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return results, models_list
+    finally:
+        os.close(lock_fd)
+
+
+def refresh_index(root=None, yaml_path=MODELS_LIST_PATH):
+    """Rewrite the index of the whole models tree at *root* after a download or delete.
+
+    Never raises: the model is already on disk (or gone), and failing the operation
+    would only make the user repeat it. The failure is logged on stderr, and the host
+    lists again the next time it finds no index. Returns whether the index was written.
+    """
+    root = root or models_root()
+    try:
+        write_index(root, root, yaml_path, os.environ.get("BOARD_NAME") or None)
+        return True
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"Could not write {os.path.join(root, INDEX_NAME)}: {exc}", file=sys.stderr, flush=True)
+        return False
+
+
+def build_listing(models_dir, yaml_path, supported_board=None):
+    """List every model models-list.yaml declares, plus the ad-hoc GGUFs on disk.
+
+    Returns ``(results, models_list)``: the listing entries, private ``_`` keys
+    included, and the parsed models-list.yaml they were built from. Raises
+    FileNotFoundError when models-list.yaml is missing.
+    """
+    if not os.path.isfile(yaml_path):
+        raise FileNotFoundError(f"models-list.yaml not found at {yaml_path}")
+    _SEARCH_DIR_CACHE.clear()
+
+    models_list = load_models_list(yaml_path)
+    all_models = []
+    for entry in models_list:
+        all_models.extend(get_model_info(entry))
+
+    # Filter by supported board
+    if supported_board:
+        all_models = [m for m in all_models if not m["supported_boards"] or supported_board in m["supported_boards"]]
+
+    # Keep the platform of the board being listed (its variables drive the outdated check); the first one otherwise
+    board = supported_board or os.environ.get("BOARD_NAME", "")
+    deduped = {}
+    for info in all_models:
+        current = deduped.get(info["id"])
+        if current is None or (board and info.get("platform") == board and current.get("platform") != board):
+            deduped[info["id"]] = info
+    all_models = list(deduped.values())
+
+    results = []
+    for model_info in all_models:
+        if model_info.get("pre_loaded"):
+            exists = True
+            entry = {
+                "id": model_info["id"],
+                "name": model_info["name"],
+                "handler": model_info["handler"],
+                "runtime": model_info["runtime"],
+                "model_publisher": model_info["model_publisher"],
+                "model_origin": ORIGIN_BUILTIN,
+                "installed": True,
+                "size_mb": listed_size_mb(True, None, model_info.get("model_size_mb")),
+            }
+            if model_info.get("model_size_mb") is not None:
+                entry["model_size_mb"] = model_info["model_size_mb"]
+        else:
+            exists, path = check_model_exists(model_info, models_dir)
+            # Per-model ".download" marker present => download in progress/incomplete.
+            downloading = bool(model_is_downloading(model_info, models_dir))
+            installed = exists and not downloading
+            disk_size_bytes = path_size_bytes(path) if installed else None
+            disk_size_mb = size_mb(disk_size_bytes)
+            entry = {
+                "id": model_info["id"],
+                "name": model_info["name"],
+                "handler": model_info["handler"],
+                "runtime": model_info["runtime"],
+                "model_publisher": model_info["model_publisher"],
+                "model_origin": ORIGIN_BUILTIN,
+                "installed": installed,
+                "downloading": downloading,
+                "size_mb": listed_size_mb(installed, disk_size_mb, model_info.get("model_size_mb")),
+            }
+            if model_info.get("model_size_mb") is not None:
+                entry["model_size_mb"] = model_info["model_size_mb"]
+            if exists:
+                entry["path"] = path
+            if disk_size_mb is not None:
+                entry["disk_size_mb"] = disk_size_mb
+                entry["_disk_size_bytes"] = disk_size_bytes
+            # Read the record regardless of `exists`: check_model_exists() cannot
+            # resolve the nested model_directory of a Hugging Face model, whose
+            # status is only fixed up by the llamacpp merge below.
+            metadata = model_metadata(model_info, models_dir, path if exists else None)
+            if metadata is not None:
+                entry["download_metadata"] = metadata
+                stale = outdated_fields(model_info, metadata)
+                entry["outdated"] = bool(stale)
+                if stale:
+                    entry["outdated_fields"] = stale
+
+        results.append(entry)
+
+    # Scan for llamacpp .gguf models on the filesystem. A scanned file may be the one
+    # a models-list.yaml entry declares — matched by its location, since the entry's
+    # nested model_directory the YAML path check couldn't resolve — and then its
+    # filesystem status is merged into that entry instead of listing the model twice.
+    # Anything else is an ad-hoc download and is listed as its own entry.
+    by_id = {entry["id"]: entry for entry in results}
+    info_by_id = {info["id"]: info for info in all_models}
+    declarations = declared_gguf_files(models_list)
+    merged_ids = set()
+    for m in find_llamacpp_models(models_dir, declarations):
+        rel_dir = m.pop("_rel_dir")
+        filename = m.pop("_filename")
+        declared_id = declared_model_id(declarations, rel_dir, filename, merged_ids)
+        existing = by_id.get(declared_id) if declared_id else None
+        if existing is not None:
+            merged_ids.add(declared_id)
+            # Keep the canonical YAML name/handler/model_size_mb/model_origin (the
+            # model is declared, so it is not user-configured); take the
+            # filesystem-derived status and on-disk details.
+            existing["installed"] = m["installed"]
+            existing["downloading"] = m["downloading"]
+            if "path" in m:
+                existing["path"] = m["path"]
+            # The YAML path check may have measured a partial or unrelated folder:
+            # the scanned file is the authority on what this model measures.
+            existing.pop("disk_size_mb", None)
+            existing.pop("_disk_size_bytes", None)
+            if m.get("disk_size_mb") is not None:
+                existing["disk_size_mb"] = m["disk_size_mb"]
+                existing["_disk_size_bytes"] = m.get("_disk_size_bytes")
+            existing["size_mb"] = listed_size_mb(m["installed"], m.get("disk_size_mb"), existing.get("model_size_mb"), m.get("size_mb"))
+            if "mmproj" in m:
+                existing["mmproj"] = m["mmproj"]
+            if "download_metadata" in m and "download_metadata" not in existing:
+                # The record was matched by the file's location rather than by the
+                # entry's id — an ad-hoc install this catalog release adopted, whose
+                # recorded id is the old path-qualified snapshot. Its inputs are
+                # still what the install was downloaded with, so the outdated check
+                # runs on them here, as it does for an id-matched record above.
+                existing["download_metadata"] = m["download_metadata"]
+                info = info_by_id.get(declared_id)
+                if info is not None:
+                    stale = outdated_fields(info, m["download_metadata"])
+                    existing["outdated"] = bool(stale)
+                    if stale:
+                        existing["outdated_fields"] = stale
+        else:
+            if m["id"] in by_id:
+                # Same name as a model this file is not: qualify the id by location
+                qualified = f"{rel_dir}/{m['name']}" if rel_dir else m["name"]
+                m["id"] = f"llamacpp:{qualified}"
+                m["name"] = qualified
+            results.append(m)
+            by_id[m["id"]] = m
+
+    return results, models_list
+
+
 def main():
     parser = argparse.ArgumentParser(description="List all models and their filesystem status.")
     parser.add_argument(
@@ -519,135 +876,34 @@ def main():
         metavar="BOARD",
         help="Filter models by supported board (e.g. ventunoq). Models without a supported_boards entry are always included.",
     )
+    parser.add_argument(
+        "--write-index",
+        metavar="ROOT",
+        help=f"Also write the listing to ROOT/{INDEX_NAME}, ROOT being the models root --models-dir is (or is inside of). "
+        "Nothing else is printed unless --json is given.",
+    )
+    parser.add_argument(
+        "--refresh-index",
+        action="store_true",
+        help=f"Rewrite the index of the mounted models root (MODELS_ROOT, default {MODELS_ROOT_DEFAULT}) for BOARD_NAME and exit; "
+        "a failure is logged on stderr and never fails the caller.",
+    )
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.yaml_path):
-        print(json.dumps({"event": "error", "description": f"models-list.yaml not found at {args.yaml_path}"}))
+    if args.refresh_index:
+        refresh_index()
+        return
+
+    try:
+        if args.write_index:
+            results, _ = write_index(args.write_index, args.models_dir, args.yaml_path, args.supported_board)
+        else:
+            results, _ = build_listing(args.models_dir, args.yaml_path, args.supported_board)
+    except FileNotFoundError as exc:
+        print(json.dumps({"event": "error", "description": str(exc)}))
         sys.exit(1)
-
-    models_list = load_models_list(args.yaml_path)
-    all_models = []
-    for entry in models_list:
-        all_models.extend(get_model_info(entry))
-
-    # Filter by supported board
-    if args.supported_board:
-        all_models = [m for m in all_models if not m["supported_boards"] or args.supported_board in m["supported_boards"]]
-
-    # Keep the platform of the board being listed (its variables drive the outdated check); the first one otherwise
-    board = args.supported_board or os.environ.get("BOARD_NAME", "")
-    deduped = {}
-    for info in all_models:
-        current = deduped.get(info["id"])
-        if current is None or (board and info.get("platform") == board and current.get("platform") != board):
-            deduped[info["id"]] = info
-    all_models = list(deduped.values())
-
-    results = []
-    for model_info in all_models:
-        if model_info.get("pre_loaded"):
-            exists = True
-            entry = {
-                "id": model_info["id"],
-                "name": model_info["name"],
-                "handler": model_info["handler"],
-                "runtime": model_info["runtime"],
-                "model_publisher": model_info["model_publisher"],
-                "model_origin": ORIGIN_BUILTIN,
-                "installed": True,
-                "size_mb": listed_size_mb(True, None, model_info.get("model_size_mb")),
-            }
-            if model_info.get("model_size_mb") is not None:
-                entry["model_size_mb"] = model_info["model_size_mb"]
-        else:
-            exists, path = check_model_exists(model_info, args.models_dir)
-            # Per-model ".download" marker present => download in progress/incomplete.
-            downloading = bool(model_is_downloading(model_info, args.models_dir))
-            installed = exists and not downloading
-            disk_size_mb = get_dir_size_mb(path) if installed else None
-            entry = {
-                "id": model_info["id"],
-                "name": model_info["name"],
-                "handler": model_info["handler"],
-                "runtime": model_info["runtime"],
-                "model_publisher": model_info["model_publisher"],
-                "model_origin": ORIGIN_BUILTIN,
-                "installed": installed,
-                "downloading": downloading,
-                "size_mb": listed_size_mb(installed, disk_size_mb, model_info.get("model_size_mb")),
-            }
-            if model_info.get("model_size_mb") is not None:
-                entry["model_size_mb"] = model_info["model_size_mb"]
-            if exists:
-                entry["path"] = path
-            if disk_size_mb is not None:
-                entry["disk_size_mb"] = disk_size_mb
-            # Read the record regardless of `exists`: check_model_exists() cannot
-            # resolve the nested model_directory of a Hugging Face model, whose
-            # status is only fixed up by the llamacpp merge below.
-            metadata = model_metadata(model_info, args.models_dir, path if exists else None)
-            if metadata is not None:
-                entry["download_metadata"] = metadata
-                stale = outdated_fields(model_info, metadata)
-                entry["outdated"] = bool(stale)
-                if stale:
-                    entry["outdated_fields"] = stale
-
-        results.append(entry)
-
-    # Scan for llamacpp .gguf models on the filesystem. A scanned file may be the one
-    # a models-list.yaml entry declares — matched by its location, since the entry's
-    # nested model_directory the YAML path check couldn't resolve — and then its
-    # filesystem status is merged into that entry instead of listing the model twice.
-    # Anything else is an ad-hoc download and is listed as its own entry.
-    by_id = {entry["id"]: entry for entry in results}
-    info_by_id = {info["id"]: info for info in all_models}
-    declarations = declared_gguf_files(models_list)
-    merged_ids = set()
-    for m in find_llamacpp_models(args.models_dir, declarations):
-        rel_dir = m.pop("_rel_dir")
-        filename = m.pop("_filename")
-        declared_id = declared_model_id(declarations, rel_dir, filename, merged_ids)
-        existing = by_id.get(declared_id) if declared_id else None
-        if existing is not None:
-            merged_ids.add(declared_id)
-            # Keep the canonical YAML name/handler/model_size_mb/model_origin (the
-            # model is declared, so it is not user-configured); take the
-            # filesystem-derived status and on-disk details.
-            existing["installed"] = m["installed"]
-            existing["downloading"] = m["downloading"]
-            if "path" in m:
-                existing["path"] = m["path"]
-            # The YAML path check may have measured a partial or unrelated folder:
-            # the scanned file is the authority on what this model measures.
-            existing.pop("disk_size_mb", None)
-            if m.get("disk_size_mb") is not None:
-                existing["disk_size_mb"] = m["disk_size_mb"]
-            existing["size_mb"] = listed_size_mb(m["installed"], m.get("disk_size_mb"), existing.get("model_size_mb"), m.get("size_mb"))
-            if "mmproj" in m:
-                existing["mmproj"] = m["mmproj"]
-            if "download_metadata" in m and "download_metadata" not in existing:
-                # The record was matched by the file's location rather than by the
-                # entry's id — an ad-hoc install this catalog release adopted, whose
-                # recorded id is the old path-qualified snapshot. Its inputs are
-                # still what the install was downloaded with, so the outdated check
-                # runs on them here, as it does for an id-matched record above.
-                existing["download_metadata"] = m["download_metadata"]
-                info = info_by_id.get(declared_id)
-                if info is not None:
-                    stale = outdated_fields(info, m["download_metadata"])
-                    existing["outdated"] = bool(stale)
-                    if stale:
-                        existing["outdated_fields"] = stale
-        else:
-            if m["id"] in by_id:
-                # Same name as a model this file is not: qualify the id by location
-                qualified = f"{rel_dir}/{m['name']}" if rel_dir else m["name"]
-                m["id"] = f"llamacpp:{qualified}"
-                m["name"] = qualified
-            results.append(m)
-            by_id[m["id"]] = m
+    results = [public_entry(r) for r in results]
 
     # Apply installed/not-installed filters once, after merging.
     if args.installed_only:
@@ -657,7 +913,7 @@ def main():
 
     if args.output_json:
         print(json.dumps({"event": "info", "models": results}, indent=2))
-    else:
+    elif not args.write_index:
         installed_count = sum(1 for r in results if r["installed"])
         total_count = len(results)
         print(f"Models: {installed_count}/{total_count} installed\n")

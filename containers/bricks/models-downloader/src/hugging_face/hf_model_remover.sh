@@ -16,7 +16,11 @@ fi
 python /app/hugging_face/hf_downloader.py "${args[@]}"
 exit_code=$?
 
-if [ "${exit_code}" -ne 0 ]; then
+# 75: another download or delete holds the repository's lock, and the
+# install_in_progress event is already out.
+if [ "${exit_code}" -eq 75 ]; then
+    exit 75
+elif [ "${exit_code}" -ne 0 ]; then
     echo "{\"event\": \"error\", \"description\": \"Failed to remove model: ${model_url}\"}"
     exit 1
 fi

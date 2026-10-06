@@ -120,6 +120,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.download_marker import MARKER_NAME, read_marker, write_marker
 from common.gguf_naming import catalog_gguf_declarations, declaration_covers, gguf_model_name
+from common.model_lock import CHECK_IN_PROGRESS, CHECK_INSTALLED, CHECK_NOT_INSTALLED, acquire_or_exit, is_busy, releases_locks
 from common.model_size import paths_size_mb, size_mb
 from common.model_metadata import (
     ORIGIN_BUILTIN,
@@ -133,6 +134,7 @@ from common.model_metadata import (
     write_metadata,
 )
 from common.models_list import MODELS_LIST_PATH, _iter_platform_variables, load_models_list
+from list_models import refresh_index
 
 # Quantizations tried, in order, when a model key names only a repository. Q4_0 comes
 # first because it is what the curated entries use and what the accelerated runners want,
@@ -258,6 +260,7 @@ def emit_json_info(
     downloading: bool | None = None,
     model_id: str | None = None,
     size_mb: float | None = None,
+    status: str | None = None,
 ):
     """Print an ``info`` event.
 
@@ -275,13 +278,17 @@ def emit_json_info(
         data["model_id"] = model_id
     if size_mb is not None:
         data["size_mb"] = size_mb
+    if status is not None:
+        data["status"] = status
     print(json.dumps(data), flush=True)
 
 
-def emit_json_error(description: str, downloading: bool | None = None):
+def emit_json_error(description: str, downloading: bool | None = None, status: str | None = None):
     data: dict = {"event": "error", "description": description}
     if downloading is not None:
         data["downloading"] = downloading
+    if status is not None:
+        data["status"] = status
     print(json.dumps(data), flush=True)
 
 
@@ -1528,6 +1535,7 @@ def validate_hub_source_or_exit(source: dict, token: str | None = None) -> None:
         raise SystemExit(1) from exc
 
 
+@releases_locks
 def main():
     parser = argparse.ArgumentParser(description="Download an Hugging Face model via HF download API")
     parser.add_argument(
@@ -1681,6 +1689,11 @@ def main():
             flush=True,
         )
     elif args.check:
+        # The repository's lock first: held means a download or delete is running on
+        # this directory right now, whatever the files and the marker say.
+        if is_busy(repo_id):
+            emit_json_info(f"Model downloading: {repo_id}", downloading=True, status=CHECK_IN_PROGRESS)
+            return
         # Files first, marker second: the marker is per repository, but a repository
         # directory holds several quantizations, so a download in progress there says
         # nothing about the one being asked for — which may well be installed already.
@@ -1688,14 +1701,16 @@ def main():
         # it reads as the download still in progress, which the next download clears.
         if is_installed(output_dir, patterns) and not unfinished_files(output_dir, patterns):
             present = [str(p) for p in matching_files(output_dir, patterns) if p.suffix == ".gguf"]
-            emit_json_info(f"Model exists: {allow_pattern}", downloading=False, size_mb=downloaded_size_mb(present))
+            emit_json_info(f"Model exists: {allow_pattern}", downloading=False, size_mb=downloaded_size_mb(present), status=CHECK_INSTALLED)
         elif (Path(output_dir) / MARKER_NAME).is_file():
-            # A ".download" marker means a download is in progress or was interrupted
-            emit_json_info(f"Model downloading: {repo_id}", downloading=True)
+            # A ".download" marker with the lock free is a download that was killed:
+            # the next download discards it, so the model is not installed.
+            emit_json_info(f"Model downloading: {repo_id}", downloading=True, status=CHECK_NOT_INSTALLED)
         else:
-            emit_json_error(f"Model does not exist: {allow_pattern}", downloading=False)
+            emit_json_error(f"Model does not exist: {allow_pattern}", downloading=False, status=CHECK_NOT_INSTALLED)
             raise SystemExit(1)
     elif args.delete:
+        acquire_or_exit(repo_id)
         if args.verbose:
             emit_json_info(f"Deleting files matching '{allow_pattern}' in {output_dir}")
         delete_matched_files(output_dir, args.output_dir, allow_pattern, args.verbose)
@@ -1715,7 +1730,11 @@ def main():
 
         # Generate models.ini file
         generate_models_ini(Path(args.output_dir))
+        refresh_index()
     else:
+        # Held until the process exits: a second download into this repository stops
+        # here instead of reading this run's marker as a leftover and discarding it.
+        acquire_or_exit(repo_id)
         # The model directory is the repo id: the download always lands in
         # <output_dir>/<repo_id>. models-list.yaml usually spells it out, but it is
         # redundant — repo_id is a substring of the model URL (and of the model key),
@@ -1895,6 +1914,7 @@ def main():
         marker = Path(output_dir) / MARKER_NAME
         if marker.exists():
             marker.unlink()
+        refresh_index()
 
 
 if __name__ == "__main__":

@@ -104,12 +104,14 @@ def paths_size_mb(paths):
     return size_mb(paths_size_bytes(paths))
 
 
-def exists_event(description, path, downloading=None):
+def exists_event(description, path, downloading=None, status=None):
     """The "Model exists" info event for the model at *path*."""
     data = {"event": "info", "description": description}
     if downloading is not None:
         data["downloading"] = downloading
     data["size_mb"] = size_mb(path_size_bytes(path))
+    if status is not None:
+        data["status"] = status
     return data
 
 
@@ -117,10 +119,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Print a 'Model exists' event sized with size_mb.")
     parser.add_argument("--description", required=True)
     parser.add_argument("--downloading", choices=("true", "false"), help="Also report the downloading flag.")
+    parser.add_argument("--status", help="Also report the check status (e.g. installed).")
     parser.add_argument("path")
     args = parser.parse_args(argv)
     downloading = None if args.downloading is None else args.downloading == "true"
-    print(json.dumps(exists_event(args.description, args.path, downloading)), flush=True)
+    print(json.dumps(exists_event(args.description, args.path, downloading, args.status)), flush=True)
 
 
 if __name__ == "__main__":

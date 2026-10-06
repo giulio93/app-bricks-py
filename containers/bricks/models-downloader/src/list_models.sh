@@ -4,4 +4,6 @@
 #
 # SPDX-License-Identifier: MPL-2.0
 
-python /app/list_models.py --json --supported-board ${BOARD_NAME}
+# Writes the index the host reads (/models/.models-index.yaml), and prints the same
+# listing as JSON for hosts that still parse it.
+python /app/list_models.py --json --supported-board "${BOARD_NAME}" --write-index /models

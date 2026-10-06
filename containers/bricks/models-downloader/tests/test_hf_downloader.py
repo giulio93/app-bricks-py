@@ -1316,7 +1316,13 @@ def test_check_answers_for_the_requested_quantization_only(tmp_path, monkeypatch
     # Installed, even though the repository directory carries a marker for another file.
     (repo / MARKER_NAME).write_text("{}")
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q4_0", "--output-dir", str(models_dir))
-    assert read_events(capsys)[-1] == {"event": "info", "description": "Model exists: *Q4_0*.gguf", "downloading": False, "size_mb": 0.0}
+    assert read_events(capsys)[-1] == {
+        "event": "info",
+        "description": "Model exists: *Q4_0*.gguf",
+        "downloading": False,
+        "size_mb": 0.0,
+        "status": "installed",
+    }
 
     # The quantization the marker stands for is the one still on its way.
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
@@ -1326,7 +1332,12 @@ def test_check_answers_for_the_requested_quantization_only(tmp_path, monkeypatch
     (repo / MARKER_NAME).unlink()
     with pytest.raises(SystemExit):
         _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF:Q3_K_S", "--output-dir", str(models_dir))
-    assert read_events(capsys)[-1] == {"event": "error", "description": "Model does not exist: *Q3_K_S*.gguf", "downloading": False}
+    assert read_events(capsys)[-1] == {
+        "event": "error",
+        "description": "Model does not exist: *Q3_K_S*.gguf",
+        "downloading": False,
+        "status": "not_installed",
+    }
 
 
 def test_check_does_not_call_a_file_its_stopped_download_left_installed(tmp_path, monkeypatch, capsys):
@@ -1345,6 +1356,7 @@ def test_check_does_not_call_a_file_its_stopped_download_left_installed(tmp_path
         "event": "info",
         "description": "Model downloading: unsloth/Qwen3-0.6B-GGUF",
         "downloading": True,
+        "status": "not_installed",
     }
 
 
@@ -1879,7 +1891,13 @@ def test_check_finds_a_bare_repository_installed_as_a_fallback(tmp_path, monkeyp
 
     _run_main(monkeypatch, "--check", "--model-url", "unsloth/Qwen3-0.6B-GGUF", "--output-dir", str(models_dir))
 
-    assert read_events(capsys)[-1] == {"event": "info", "description": "Model exists: *Q8_0*.gguf", "downloading": False, "size_mb": 0.0}
+    assert read_events(capsys)[-1] == {
+        "event": "info",
+        "description": "Model exists: *Q8_0*.gguf",
+        "downloading": False,
+        "size_mb": 0.0,
+        "status": "installed",
+    }
 
 
 def test_delete_removes_the_fallback_a_bare_repository_installed(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ handlers:
       image: ${DOCKER_REGISTRY_BASE:-ghcr.io/arduino/}app-bricks/models-downloader:__BRICKS_RELEASE_VERSION__
       volumes:
         - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}/${models_repository}:/models
+        - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}:/models_root
       actions:
         - download:
             command: ["/app/ai_hub/ai_hub_model_downloader.sh"]
@@ -23,6 +24,7 @@ handlers:
       image: ${DOCKER_REGISTRY_BASE:-ghcr.io/arduino/}app-bricks/models-downloader:__BRICKS_RELEASE_VERSION__
       volumes:
         - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}/${models_repository}:/models
+        - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}:/models_root
       actions:
         - download:
             command: ["/app/edge_impulse/ei_model_downloader.sh"]
@@ -37,6 +39,7 @@ handlers:
       image: ${DOCKER_REGISTRY_BASE:-ghcr.io/arduino/}app-bricks/models-downloader:__BRICKS_RELEASE_VERSION__
       volumes:
         - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}/${models_repository}:/models
+        - ${MODELS_PATH:-/var/lib/arduino-app-cli/models}:/models_root
       actions:
         - download:
             command: ["/app/hugging_face/hf_model_downloader.sh"]

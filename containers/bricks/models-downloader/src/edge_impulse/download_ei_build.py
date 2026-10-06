@@ -24,8 +24,11 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.download_marker import write_marker
 from common.http_download import check, download, emit_json_error, install_signal_handlers
+from common.model_dir import EXISTS, prepare_model_dir
+from common.model_lock import acquire_or_exit, releases_locks
 from common.model_metadata import write_metadata
 from common.model_size import path_size_bytes, size_mb
+from list_models import refresh_index
 
 
 BASE_URL = "https://studio.edgeimpulse.com/v1/api/{project_id}/deployment/download?type={target}&impulseId={impulse_id}"
@@ -73,6 +76,7 @@ def _wipe_model_dir(model_dir: str) -> None:
     shutil.rmtree(model_dir, ignore_errors=True)
 
 
+@releases_locks
 def main():
     parser = argparse.ArgumentParser(description="Download an Edge Impulse deployment build artifact via the EI REST API.")
     parser.add_argument(
@@ -146,6 +150,12 @@ def main():
     # phantom (empty) model folder that would be mistaken for an installed model.
     marker = os.path.join(args.output_dir, ".download")
     if not args.info:
+        # Held until the process exits: a second download of the same model stops
+        # here instead of reading this run's marker as a leftover and wiping its files.
+        acquire_or_exit(os.path.basename(os.path.normpath(args.output_dir)))
+        installed = lambda path: os.path.isfile(os.path.join(path, args.output_name))  # noqa: E731
+        if prepare_model_dir(args.output_dir, installed, args.output_name) == EXISTS:
+            return
         write_marker(
             args.output_dir,
             handler="ei-handler",
@@ -177,6 +187,7 @@ def main():
             write_metadata(args.output_dir, handler="ei-handler")
             if os.path.exists(marker):
                 os.remove(marker)
+            refresh_index()
             # Sized like the listing sizes the model folder, so the two agree.
             print(
                 json.dumps({

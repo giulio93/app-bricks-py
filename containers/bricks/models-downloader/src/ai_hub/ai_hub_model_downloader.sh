@@ -7,25 +7,8 @@
 
 cd /models
 
-model_path="/models/${model_directory}"
-
-# Decide whether a usable model is already present. A ".download" marker, or a
-# leftover directory holding no model content (only the marker and/or the
-# ".arduino_metadata.yaml" record, including the ".tmp" sibling of an interrupted
-# atomic write), means a previous run was interrupted (e.g. SIGKILL) and must be
-# wiped and retried rather than reported as "Model exists".
-if [ -f "${model_path}/.download" ] || { [ -d "${model_path}" ] && [ -z "$(find "${model_path}" -mindepth 1 ! -name '.download' ! -name '.arduino_metadata.yaml*' -print -quit 2>/dev/null)" ]; }; then
-    echo "{\"event\": \"info\", \"description\": \"Removing incomplete previous download: ${model_directory}\"}"
-    rm -rf "${model_path:?}"
-elif [ -d "${model_path}" ]; then
-    python /app/common/model_size.py --description "Model exists: ${model_directory}" "${model_path}" \
-        || echo "{\"event\": \"info\", \"description\": \"Model exists: ${model_directory}\", \"size_mb\": null}"
-    exit 0
-fi
-
-# Ensure the model directory exists
-mkdir -p "${model_path}"
-
+# The python downloader takes the model's lock, then wipes what a killed run left
+# or reports the model as already there (common/model_dir.py), then downloads.
 cmd=(python /app/ai_hub/download_ai_hub_model.py
     --model_type "$model_type"
     --model_name "$model_name"

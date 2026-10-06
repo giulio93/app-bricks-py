@@ -26,3 +26,11 @@ def _clear_scandir_cache():
     list_models._SEARCH_DIR_CACHE.clear()
     yield
     list_models._SEARCH_DIR_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def models_root(tmp_path_factory, monkeypatch):
+    """A models root of its own per test, standing in for the /models_root mount."""
+    root = tmp_path_factory.mktemp("models_root")
+    monkeypatch.setenv("MODELS_ROOT", str(root))
+    return root

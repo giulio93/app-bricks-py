@@ -15,8 +15,11 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.download_marker import write_marker
 from common.http_download import download, download_and_extract, emit_json_error, install_signal_handlers
+from common.model_dir import EXISTS, prepare_model_dir
+from common.model_lock import acquire_or_exit, releases_locks
 from common.model_metadata import write_metadata
 from common.model_size import path_size_bytes, size_mb
+from list_models import refresh_index
 
 
 def _cli_failure_detail(exc: subprocess.CalledProcessError) -> str:
@@ -45,6 +48,7 @@ def _wipe_model_dir(model_dir: str, base_dir: str) -> None:
     shutil.rmtree(model_dir, ignore_errors=True)
 
 
+@releases_locks
 def main():
     parser = argparse.ArgumentParser(description="Download an AI Hub model via the AI Hub API.")
     parser.add_argument(
@@ -111,6 +115,13 @@ def main():
     # the marker and the metadata record are skipped rather than dropped there.
     model_directory = os.environ.get("model_directory", "")
     model_dir = os.path.join(args.output_dir, model_directory) if model_directory else ""
+
+    # Held until the process exits: a second download of the same model stops here
+    # instead of reading this run's marker as a leftover and wiping its files.
+    acquire_or_exit(model_directory or args.model_name)
+    if model_dir and prepare_model_dir(model_dir, lambda _path: True, model_directory) == EXISTS:
+        return
+
     marker = ""
     if model_dir:
         marker = write_marker(
@@ -170,6 +181,7 @@ def main():
             write_metadata(model_dir, handler="ai-hub-handler")
         if marker and os.path.exists(marker):
             os.remove(marker)
+        refresh_index()
         # Sized like the listing sizes the model directory, so the two agree; without
         # a per-model directory there is nothing of this model alone to measure.
         print(

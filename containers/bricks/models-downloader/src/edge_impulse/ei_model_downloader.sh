@@ -24,22 +24,8 @@ fi
 model_folder="${model_name%.*}"
 model_path="/models/${model_folder}"
 
-# A ".download" marker, or a leftover folder holding no model content (only the
-# marker and/or the ".arduino_metadata.yaml" record), means a previous run was
-# killed mid-download and must be wiped and retried; absent but the file exists
-# => already complete.
-if [ -f "${model_path}/.download" ] || { [ -d "${model_path}" ] && [ -z "$(find "${model_path}" -mindepth 1 ! -name '.download' ! -name '.arduino_metadata.yaml*' -print -quit 2>/dev/null)" ]; }; then
-    echo "{\"event\": \"info\", \"description\": \"Removing incomplete previous download: ${model_folder}\"}"
-    rm -rf "${model_path:?}"
-elif [ -f "${model_path}/${model_name}" ]; then
-    python /app/common/model_size.py --description "Model exists: ${model_name}" "${model_path}" \
-        || echo "{\"event\": \"info\", \"description\": \"Model exists: ${model_name}\", \"size_mb\": null}"
-    exit 0
-fi
-
-# Ensure the model directory exists
-mkdir -p "${model_path}"
-
+# The python downloader takes the model's lock, then wipes what a killed run left
+# or reports the model as already there (common/model_dir.py), then downloads.
 # Use exec so python replaces this shell as PID 1 and receives SIGINT/SIGTERM
 # directly, allowing it to clean up partial downloads before exiting.
 exec python /app/edge_impulse/download_ei_build.py \
